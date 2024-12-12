@@ -584,20 +584,28 @@ class PartitionedParameterCoordinator:
         #           f"release_to_cpu={self.release_to_cpu}")
         
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
-            has_local_copy = self._check_local_copies(param)
-            
-            if has_local_copy and param.ds_status != ZeroParamStatus.AVAILABLE:
-                # AVAILABLE 상태가 아닐 때만 gather 시도
-                self._gather_from_local_gpus(param)
-            elif param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
-                # NVME offload 사용하는 경우
-                param.partition()
-            elif self.release_to_cpu:
-                # CPU로 이동
-                logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
-                self._manage_cpu_cache(param)
-                param.partition()
+            try:
+                # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
+                has_local_copy = self._check_local_copies(param)
+                
+                if has_local_copy and param.ds_status != ZeroParamStatus.AVAILABLE:
+                    # AVAILABLE 상태가 아닐 때만 gather 시도
+                    self._gather_from_local_gpus(param)
+                elif param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
+                    # NVME offload 사용하는 경우
+                    param.partition()
+                elif self.release_to_cpu:
+                    # CPU로 이동
+                    logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
+                    self._manage_cpu_cache(param)
+                    param.partition()
+                
+            except Exception as e:
+                logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
+                # 에러 발생 시 기본 동작 - CPU로 이동
+                if self.release_to_cpu:
+                    self._manage_cpu_cache(param)
+                    param.partition()
 
     def _manage_cpu_cache(self, param):
         """CPU 캐시 관리 - 노드 내 GPU에 없는 파라미터만 캐시"""
@@ -738,12 +746,24 @@ class PartitionedParameterCoordinator:
 
     def _check_local_copies(self, param: Parameter) -> bool:
         """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
-        has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
-                               device=get_accelerator().device_name())
-        gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
-        
-        dist.all_gather(gathered, has_param, group=self.local_group)
-        return sum(g.item() for g in gathered) > 1
+        try:
+            # CPU 텐서로 통신하여 NCCL 에러 방지
+            has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
+                                   device='cpu')
+            gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
+            
+            # CPU 통신 그룹 사용
+            dist.all_gather(gathered, has_param, group=dist.new_group(
+                ranks=list(range(self.gpus_per_node)),
+                backend='gloo'
+            ))
+            
+            return sum(g.item() for g in gathered) > 1
+            
+        except Exception as e:
+            logger.warning(f"[Local Check] Failed to check local copies for param {param.ds_id}: {str(e)}")
+            # 에러 발생 시 안전하게 False 반환
+            return False
 
     def _gather_from_local_gpus(self, param: Parameter) -> None:
         """노드 내 GPU들과 파라미터 all-gather"""
