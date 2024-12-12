@@ -132,7 +132,12 @@ class PartitionedParameterCoordinator:
         self.__profiler = PartitionedParameterProfiler(timers if ENABLE_PROFILER else None)
 
         # CPU 캐시 관련 설정
+        logger.info(f"[Init] zero_config type: {type(zero_config)}")
+        if zero_config:
+            logger.info(f"[Init] zero_config contents: {zero_config}")
+        
         self.release_to_cpu = zero_config.get('release_to_cpu', False) if zero_config else False
+        logger.info(f"[Init] release_to_cpu setting: {self.release_to_cpu}")
         if self.release_to_cpu:
             self.cpu_buffer_size = zero_config.get('release_to_cpu_buffer_size', 1e10)
             self.pin_memory = zero_config.get('release_to_cpu_pin_memory', False)
