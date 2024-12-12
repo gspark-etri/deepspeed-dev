@@ -323,17 +323,22 @@ class PartitionedParameterCoordinator:
                 for param in params_to_fetch:
                     if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                         if param.ds_id in self.cpu_param_cache:
-                            logger.info(f"[{event_name}] Cache HIT: Restoring param {param.ds_id} from CPU cache")
+                            logger.info(f"[Cache Hit] Param {param.ds_id} found in CPU cache "
+                                      f"(access count: {self.param_access_stats[param.ds_id]})")
                             self._restore_from_cache(param)
                             restored_from_cache.append(param)
                             self.cache_hits += 1
                         elif self._is_local_parameter(param):
-                            logger.info(f"[{event_name}] Local param {param.ds_id}: Using all-gather")
                             local_params.append(param)
                         else:
-                            logger.info(f"[{event_name}] Remote param {param.ds_id}: Attempting all-gather")
                             remote_params.append(param)
                             self.cache_misses += 1
+
+                # 캐시 통계는 히트가 있을 때만 출력
+                if restored_from_cache:
+                    hit_rate = len(restored_from_cache) / len(params_to_fetch) * 100
+                    logger.info(f"[Cache Stats] Module {current_submodule.__class__.__name__}: "
+                              f"hit rate {hit_rate:.1f}% ({len(restored_from_cache)}/{len(params_to_fetch)})")
 
                 # 로컬/리모트 파라미터 처리
                 if local_params:
@@ -348,11 +353,6 @@ class PartitionedParameterCoordinator:
                         logger.warning(f"[{event_name}] All-gather failed, using CPU path: {str(e)}")
                         self.__fetch_remote_params_via_cpu(remote_params)
                         
-                # 캐시 통계
-                if len(params_to_fetch) > 0:
-                    hit_rate = len(restored_from_cache) / len(params_to_fetch) * 100
-                    logger.info(f"[{phase}] Cache stats for {current_submodule.__class__.__name__}: "
-                              f"hit rate {hit_rate:.1f}% ({len(restored_from_cache)}/{len(params_to_fetch)})")
             else:
                 self.__all_gather_params(params_to_fetch, forward)
             
@@ -548,22 +548,16 @@ class PartitionedParameterCoordinator:
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            logger.info(f"=== Starting Parameter Release: {param.ds_id} ===")
-            
             if self.release_to_cpu:
-                logger.info(f"Releasing param {param.ds_id} to CPU cache")
+                logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                 self._manage_cpu_cache(param)
             param.partition()
-            
-            logger.info(f"=== Completed Parameter Release: {param.ds_id} ===")
 
     def _manage_cpu_cache(self, param):
         """CPU 캐시 관리 - LRU + Access Frequency 기반"""
         param_size = param.ds_numel * param.element_size()
         
-        # 캐시 공간 확보 
         while self.cpu_buffer_used + param_size > self.cpu_buffer_size and self.cpu_param_cache:
-            # LRU + Access Frequency 정책
             lru_params = sorted(self.param_access_stats.items(), 
                               key=lambda x: (x[1], -list(self.cpu_param_cache.keys()).index(x[0])))
             param_to_evict = lru_params[0][0]
@@ -571,11 +565,12 @@ class PartitionedParameterCoordinator:
             if param_to_evict in self.cpu_param_cache:
                 evicted_tensor = self.cpu_param_cache.pop(param_to_evict)
                 removed_size = evicted_tensor.numel() * evicted_tensor.element_size()
+                logger.info(f"[Cache Evict] Param {param_to_evict} "
+                           f"(access count: {self.param_access_stats[param_to_evict]}, "
+                           f"size: {removed_size/1e6:.2f}MB)")
                 self.cpu_buffer_used -= removed_size
-                logger.info(f"Evicted param {param_to_evict} from cache (access count: {self.param_access_stats[param_to_evict]}, size: {removed_size/1e6:.2f}MB)")
                 del self.param_access_stats[param_to_evict]
 
-        # 새 파라미터 저장
         try:
             if self.pin_memory:
                 cached_tensor = param.data.cpu().pin_memory().clone()
@@ -586,10 +581,11 @@ class PartitionedParameterCoordinator:
             self.cpu_buffer_used += param_size
             self.param_access_stats[param.ds_id] = 1
             
-            logger.info(f"Added param {param.ds_id} to cache (size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
+            logger.info(f"[Cache Add] Param {param.ds_id} "
+                       f"(size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
                         
         except RuntimeError as e:
-            logger.warning(f"Failed to cache param {param.ds_id}: {str(e)}")
+            logger.warning(f"[Cache Error] Failed to cache param {param.ds_id}: {str(e)}")
 
     @instrument_w_nvtx
     @functools.lru_cache(maxsize=None)
@@ -676,10 +672,5 @@ class PartitionedParameterCoordinator:
         """파라미터 업데이트 후 CPU 캐시 동기화"""
         if self.release_to_cpu and param.requires_grad:
             if param.ds_id in self.cpu_param_cache:
-                logger.info(f"=== Starting Parameter Update: {param.ds_id} ===")
-                logger.info(f"[Backward] Updating cached param {param.ds_id} after gradient computation")
-                
                 with torch.no_grad():
                     self.cpu_param_cache[param.ds_id].copy_(param.data.cpu())
-                    
-                logger.info(f"=== Completed Parameter Update: {param.ds_id} ===")
