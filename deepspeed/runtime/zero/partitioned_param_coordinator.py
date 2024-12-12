@@ -752,12 +752,10 @@ class PartitionedParameterCoordinator:
                                    device='cpu')
             gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
             
-            # CPU 통신 그룹 사용
-            dist.all_gather(gathered, has_param, group=dist.new_group(
-                ranks=list(range(self.gpus_per_node)),
-                backend='gloo'
-            ))
+            # 기존에 생성된 local_group 사용
+            dist.all_gather(gathered, has_param, group=self.local_group)
             
+            # 2개 이상의 GPU가 파라미터를 가지고 있는지 확인
             return sum(g.item() for g in gathered) > 1
             
         except Exception as e:
