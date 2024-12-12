@@ -136,11 +136,12 @@ class PartitionedParameterCoordinator:
         if zero_config:
             logger.info(f"[Init] zero_config contents: {zero_config}")
         
-        self.release_to_cpu = zero_config.get('release_to_cpu', False) if zero_config else False
+        self.release_to_cpu = True  # 강제 설정
         logger.info(f"[Init] release_to_cpu setting: {self.release_to_cpu}")
+        
         if self.release_to_cpu:
-            self.cpu_buffer_size = zero_config.get('release_to_cpu_buffer_size', 1e10)
-            self.pin_memory = zero_config.get('release_to_cpu_pin_memory', False)
+            self.cpu_buffer_size = zero_config.get('release_to_cpu_buffer_size', 1e11) if zero_config else 1e11
+            self.pin_memory = zero_config.get('release_to_cpu_pin_memory', True) if zero_config else True
             self.cpu_param_cache = collections.OrderedDict()  # LRU 캐시
             self.cpu_buffer_used = 0
             self.param_access_stats = collections.defaultdict(int)  # 파라미터 접근 통계
@@ -475,13 +476,13 @@ class PartitionedParameterCoordinator:
                             if self.is_complete_trace() 
                             else set(p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
         
-        logger.info(f"[Release] Module {submodule.__class__.__name__}: {len(params_to_release)} params to release")
+        #logger.info(f"[Release] Module {submodule.__class__.__name__}: {len(params_to_release)} params to release")
         
         for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
-            logger.info(f"[Release Check] Param {param.ds_id}: "
-                       f"active_modules={len(param.ds_active_sub_modules)}, "
-                       f"in_release_set={param.ds_id in params_to_release}, "
-                       f"is_external={param.is_external_param}")
+            #logger.info(f"[Release Check] Param {param.ds_id}: "
+            #           f"active_modules={len(param.ds_active_sub_modules)}, "
+            #           f"in_release_set={param.ds_id in params_to_release}, "
+            #           f"is_external={param.is_external_param}")
             
             param.ds_active_sub_modules.discard(submodule.id)
             if param.ds_id in params_to_release and not param.is_external_param:
@@ -561,9 +562,10 @@ class PartitionedParameterCoordinator:
     @compiler.disable
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
-        logger.info(f"[Release Attempt] Param {param.ds_id}: "
-                   f"status={param.ds_status}, "
-                   f"active_modules={len(param.ds_active_sub_modules)}")
+        #logger.info(f"[Release Check] Param {param.ds_id}: "
+        #           f"status={param.ds_status}, "
+        #           f"active_modules={len(param.ds_active_sub_modules)}, "
+        #           f"release_to_cpu={self.release_to_cpu}")
         
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             if self.release_to_cpu:
@@ -692,3 +694,9 @@ class PartitionedParameterCoordinator:
             if param.ds_id in self.cpu_param_cache:
                 with torch.no_grad():
                     self.cpu_param_cache[param.ds_id].copy_(param.data.cpu())
+
+    def _is_local_parameter(self, param: Parameter) -> bool:
+        """Check if parameter is local to this process."""
+        if not hasattr(param, 'ds_id'):
+            return True
+        return param.ds_status == ZeroParamStatus.AVAILABLE

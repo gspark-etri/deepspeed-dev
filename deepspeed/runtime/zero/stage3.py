@@ -162,7 +162,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         zero_module_granularity_threshold=0,
         release_to_cpu=False,
         release_to_cpu_buffer_size=1e10,
-        release_to_cpu_pin_memory=False,
+        release_to_cpu_pin_memory=True,
     ):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
@@ -223,11 +223,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             ds_config['zero_optimization'] = {}
         
         zero_config = ds_config['zero_optimization']
-        if 'release_to_cpu' not in zero_config:
-            zero_config['release_to_cpu'] = release_to_cpu
-            zero_config['release_to_cpu_buffer_size'] = release_to_cpu_buffer_size
-            zero_config['release_to_cpu_pin_memory'] = release_to_cpu_pin_memory
+        zero_config['release_to_cpu'] = release_to_cpu  # 인자로 받은 값 우선
+        
+        # 디버그 로그 추가
+        print(f"Stage3 zero_config: {zero_config}")
+        
+        zero_config['release_to_cpu_buffer_size'] = release_to_cpu_buffer_size
+        zero_config['release_to_cpu_pin_memory'] = release_to_cpu_pin_memory
 
+        print("Stage3 config:", zero_config)  # 디버그용
         self.parameter_offload = self.initialize_ds_offload(
             module=module,
             timers=timers,
@@ -1791,59 +1795,32 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     @instrument_w_nvtx
     def get_grad_norm_direct(self, gradients, params, norm_type=2):
-        """Clips gradient norm of an iterable of parameters.
-
-        This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-        added functionality to handle model parallel parameters. Note that
-        the gradients are modified in place.
-
-        Arguments:
-            parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-                single Tensor that will have gradients normalized
-            max_norm (float or int): max norm of the gradients
-            norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-                infinity norm.
-
-        Returns:
-            Total norm of the parameters (viewed as a single vector).
-        """
+        """Clips gradient norm of an iterable of parameters."""
         norm_type = float(norm_type)
         if norm_type == inf:
             total_norm = max(g.data.abs().max() for g in gradients)
             total_norm_cuda = get_accelerator().FloatTensor([float(total_norm)])
+            # 여기 수정
             dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.MAX, group=self.dp_process_group)
-
-            # Take max across all GPUs.
+            
             self._model_parallel_all_reduce(tensor=total_norm_cuda, op=dist.ReduceOp.MAX)
             total_norm = total_norm_cuda[0]
         else:
-            # if dist.get_rank() == 0:
-            #    logger.info(f"Total Norm beginning {total_norm}")
             grad_norms = []
             for g, p in zip(gradients, params):
                 if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
                     grad_norms.append(g.to(get_accelerator().device_name(), non_blocking=True).double().norm(2))
 
-            # Sum across all model parallel GPUs.
             if len(grad_norms) == 0:
-                # FIX https://github.com/microsoft/DeepSpeed/issues/3564
-                total_norm_cuda = torch.tensor(0,
-                                               dtype=gradients[0].dtype).to(get_accelerator().device_name()).double()
+                total_norm_cuda = torch.tensor(0, dtype=gradients[0].dtype).to(get_accelerator().device_name()).double()
             else:
                 total_norm_cuda = torch.sum(torch.pow(torch.stack(grad_norms), 2))
 
+            # 여기도 수정 
             dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=self.dp_process_group)
 
             self._model_parallel_all_reduce(tensor=total_norm_cuda, op=dist.ReduceOp.SUM)
-
             total_norm = total_norm_cuda**(1. / norm_type)
-
-        norm_is_inf = total_norm.isinf()
-        norm_is_nan = total_norm.isnan()
-        inf_or_nan = norm_is_nan.logical_or(norm_is_inf)
-
-        err = torch.tensor(-1.0, device=self.device, dtype=torch.float)
-        total_norm = inf_or_nan * err + inf_or_nan.logical_not() * total_norm
 
         return total_norm
 
