@@ -302,22 +302,53 @@ class PartitionedParameterCoordinator:
                 }))
 
         params_to_fetch = frozenset(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
-        fetch_numel = sum(
-            [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
-
+        
+        # 프로파일링 시작
+        event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
+        fetch_numel = sum([p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+        
         if fetch_numel > 0:
-            event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
             self._dump_param_ids(event_name, current_submodule.id,
-                                 [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+                               [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
             self.__profiler.start_event(event_name)
-            # kick off all gather for params in the immediately required submodule
-            #for param in params_to_fetch:
-            if logger.isEnabledFor(logging.DEBUG):
+            
+            if self.release_to_cpu:
+                local_params = []
+                remote_params = []
+                restored_from_cache = []
+                
                 for param in params_to_fetch:
-                    debug_rank0(f"-fetch: {param.ds_summary()}")
-            self.__all_gather_params(params_to_fetch, forward)
+                    if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                        if param.ds_id in self.cpu_param_cache:
+                            self._restore_from_cache(param)
+                            restored_from_cache.append(param)
+                            self.cache_hits += 1
+                        elif self._is_local_parameter(param):
+                            local_params.append(param)
+                        else:
+                            remote_params.append(param)
+                            self.cache_misses += 1
+
+                # 로컬/리모트 파라미터 처리
+                if local_params:
+                    self.__all_gather_params(local_params, forward)
+                if remote_params:
+                    try:
+                        self.__all_gather_params(remote_params, forward)
+                    except Exception as e:
+                        logger.warning(f"All-gather failed for remote params: {str(e)}")
+                        self.__fetch_remote_params_via_cpu(remote_params)
+                        
+                # 캐시 통계
+                if len(params_to_fetch) > 0:
+                    hit_rate = len(restored_from_cache) / len(params_to_fetch) * 100
+                    logger.debug(f"Cache stats: hit rate {hit_rate:.1f}%")
+            else:
+                self.__all_gather_params(params_to_fetch, forward)
+            
             self.__profiler.stop_event(event_name, fetch_numel)
 
+        # Wait 로직 유지
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)
@@ -608,3 +639,31 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
+
+    def _restore_from_cache(self, param):
+        """CPU 캐시에서 파라미터 복원 개선"""
+        cached_tensor = self.cpu_param_cache[param.ds_id]
+        
+        # 1. GPU 메모리 명시적 관리
+        if hasattr(param, 'gpu_buffer'):
+            del param.gpu_buffer
+        
+        # 2. 동기화 보장
+        with torch.cuda.stream(self.__allgather_stream):
+            param.data = cached_tensor.cuda(non_blocking=True)
+        
+        # 3. 캐시 상태 업데이트
+        param.ds_status = ZeroParamStatus.AVAILABLE
+        self.param_access_stats[param.ds_id] += 1
+        
+        # 4. CPU 메모리 관리
+        self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
+        del self.cpu_param_cache[param.ds_id]
+        del cached_tensor
+
+    def post_backward_hook(self, param):
+        """파라미터 업데이트 후 CPU 캐시 동기화"""
+        if self.release_to_cpu and param.requires_grad:
+            if param.ds_id in self.cpu_param_cache:
+                with torch.no_grad():
+                    self.cpu_param_cache[param.ds_id].copy_(param.data.cpu())
