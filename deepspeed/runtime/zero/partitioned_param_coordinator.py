@@ -292,8 +292,8 @@ class PartitionedParameterCoordinator:
         2. kick off fetch for next few parameters we will need later (prefetch)
         3. block on parameters in immediately required sub module
         """
-        phase = "Forward" if forward else "Backward"
-        logger.info(f"=== Starting {phase} for module: {current_submodule.__class__.__name__} ===")
+        #phase = "Forward" if forward else "Backward"
+        #logger.info(f"=== Starting {phase} for module: {current_submodule.__class__.__name__} ===")
         
         if logger.isEnabledFor(logging.DEBUG):
             debug_rank0(
@@ -459,7 +459,7 @@ class PartitionedParameterCoordinator:
 
         self.__step_id += 1
         
-        logger.info(f"=== Completed {phase} for module: {current_submodule.__class__.__name__} ===")
+        #logger.info(f"=== Completed {phase} for module: {current_submodule.__class__.__name__} ===")
 
     @instrument_w_nvtx
     @torch.no_grad()

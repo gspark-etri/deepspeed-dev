@@ -93,7 +93,7 @@ config = {
             #"stage3_prefetch_bucket_size" : 1e6
             "stage3_prefetch_bucket_size" : 1e3,
             "release_to_cpu": True,
-            "release_to_cpu_buffer_size": 1e10,
+            "release_to_cpu_buffer_size": 1e11,
             "release_to_cpu_pin_memory": True
         },
         "bf16": {
