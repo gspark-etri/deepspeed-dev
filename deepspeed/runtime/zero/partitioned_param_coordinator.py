@@ -747,15 +747,15 @@ class PartitionedParameterCoordinator:
     def _check_local_copies(self, param: Parameter) -> bool:
         """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
         try:
-            # CPU 텐서로 통신하여 NCCL 에러 방지
+            # CUDA 텐서로 통신
             has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
-                                   device='cpu')
+                                   device=get_accelerator().device_name())
             gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
             
             # 기존에 생성된 local_group 사용
             dist.all_gather(gathered, has_param, group=self.local_group)
             
-            # 2개 이상의 GPU가 파라미터를 가지고 있는지 확인
+            # 2개 이상의 GPU가 파라미터를 가지고 있는지 확인 
             return sum(g.item() for g in gathered) > 1
             
         except Exception as e:
