@@ -292,6 +292,9 @@ class PartitionedParameterCoordinator:
         2. kick off fetch for next few parameters we will need later (prefetch)
         3. block on parameters in immediately required sub module
         """
+        phase = "Forward" if forward else "Backward"
+        logger.info(f"=== Starting {phase} for module: {current_submodule.__class__.__name__} ===")
+        
         if logger.isEnabledFor(logging.DEBUG):
             debug_rank0(
                 f"{self.__step_id}: M{current_submodule.id}({type(current_submodule).__name__}) P{[p.ds_id for p in iter_params(current_submodule, recurse=z3_leaf_module(current_submodule))]} "
@@ -320,29 +323,36 @@ class PartitionedParameterCoordinator:
                 for param in params_to_fetch:
                     if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                         if param.ds_id in self.cpu_param_cache:
+                            logger.info(f"[{event_name}] Cache HIT: Restoring param {param.ds_id} from CPU cache")
                             self._restore_from_cache(param)
                             restored_from_cache.append(param)
                             self.cache_hits += 1
                         elif self._is_local_parameter(param):
+                            logger.info(f"[{event_name}] Local param {param.ds_id}: Using all-gather")
                             local_params.append(param)
                         else:
+                            logger.info(f"[{event_name}] Remote param {param.ds_id}: Attempting all-gather")
                             remote_params.append(param)
                             self.cache_misses += 1
 
                 # 로컬/리모트 파라미터 처리
                 if local_params:
+                    logger.info(f"[{event_name}] Processing {len(local_params)} local parameters")
                     self.__all_gather_params(local_params, forward)
+                    
                 if remote_params:
                     try:
+                        logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters via all-gather")
                         self.__all_gather_params(remote_params, forward)
                     except Exception as e:
-                        logger.warning(f"All-gather failed for remote params: {str(e)}")
+                        logger.warning(f"[{event_name}] All-gather failed, using CPU path: {str(e)}")
                         self.__fetch_remote_params_via_cpu(remote_params)
                         
                 # 캐시 통계
                 if len(params_to_fetch) > 0:
                     hit_rate = len(restored_from_cache) / len(params_to_fetch) * 100
-                    logger.debug(f"Cache stats: hit rate {hit_rate:.1f}%")
+                    logger.info(f"[{phase}] Cache stats for {current_submodule.__class__.__name__}: "
+                              f"hit rate {hit_rate:.1f}% ({len(restored_from_cache)}/{len(params_to_fetch)})")
             else:
                 self.__all_gather_params(params_to_fetch, forward)
             
@@ -448,6 +458,8 @@ class PartitionedParameterCoordinator:
                     self.__prefetch_nvme_param_partitions()
 
         self.__step_id += 1
+        
+        logger.info(f"=== Completed {phase} for module: {current_submodule.__class__.__name__} ===")
 
     @instrument_w_nvtx
     @torch.no_grad()
@@ -536,14 +548,14 @@ class PartitionedParameterCoordinator:
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            if logger.isEnabledFor(logging.DEBUG):
-                debug_rank0(f"-release: {param.ds_summary()}")
-
-            if self.release_to_cpu:
-                self._manage_cpu_cache(param)
+            logger.info(f"=== Starting Parameter Release: {param.ds_id} ===")
             
+            if self.release_to_cpu:
+                logger.info(f"Releasing param {param.ds_id} to CPU cache")
+                self._manage_cpu_cache(param)
             param.partition()
-            self.__n_available_params -= param.ds_numel
+            
+            logger.info(f"=== Completed Parameter Release: {param.ds_id} ===")
 
     def _manage_cpu_cache(self, param):
         """CPU 캐시 관리 - LRU + Access Frequency 기반"""
@@ -560,10 +572,10 @@ class PartitionedParameterCoordinator:
                 evicted_tensor = self.cpu_param_cache.pop(param_to_evict)
                 removed_size = evicted_tensor.numel() * evicted_tensor.element_size()
                 self.cpu_buffer_used -= removed_size
+                logger.info(f"Evicted param {param_to_evict} from cache (access count: {self.param_access_stats[param_to_evict]}, size: {removed_size/1e6:.2f}MB)")
                 del self.param_access_stats[param_to_evict]
-                logger.debug(f"Evicted param {param_to_evict} from cache (size: {removed_size/1e6:.2f}MB)")
 
-        # 새 파라미터 캐시에 저장
+        # 새 파라미터 저장
         try:
             if self.pin_memory:
                 cached_tensor = param.data.cpu().pin_memory().clone()
@@ -574,8 +586,7 @@ class PartitionedParameterCoordinator:
             self.cpu_buffer_used += param_size
             self.param_access_stats[param.ds_id] = 1
             
-            logger.debug(f"Added param {param.ds_id} to cache "
-                        f"(size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
+            logger.info(f"Added param {param.ds_id} to cache (size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
                         
         except RuntimeError as e:
             logger.warning(f"Failed to cache param {param.ds_id}: {str(e)}")
@@ -665,5 +676,10 @@ class PartitionedParameterCoordinator:
         """파라미터 업데이트 후 CPU 캐시 동기화"""
         if self.release_to_cpu and param.requires_grad:
             if param.ds_id in self.cpu_param_cache:
+                logger.info(f"=== Starting Parameter Update: {param.ds_id} ===")
+                logger.info(f"[Backward] Updating cached param {param.ds_id} after gradient computation")
+                
                 with torch.no_grad():
                     self.cpu_param_cache[param.ds_id].copy_(param.data.cpu())
+                    
+                logger.info(f"=== Completed Parameter Update: {param.ds_id} ===")

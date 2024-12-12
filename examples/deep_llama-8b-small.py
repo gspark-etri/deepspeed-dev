@@ -13,6 +13,12 @@ import os
 import sys
 import time
 
+import logging
+from deepspeed.utils.logging import logger
+
+# 로그 레벨 설정
+logger.setLevel(logging.DEBUG)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 
