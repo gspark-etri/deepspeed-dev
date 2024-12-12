@@ -466,9 +466,18 @@ class PartitionedParameterCoordinator:
     def release_sub_module(self, submodule: Module) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
-        params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
-            p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+        params_to_release = (self.__params_to_release(submodule, self.__step_id) 
+                            if self.is_complete_trace() 
+                            else set(p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+        
+        logger.info(f"[Release] Module {submodule.__class__.__name__}: {len(params_to_release)} params to release")
+        
         for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
+            logger.info(f"[Release Check] Param {param.ds_id}: "
+                       f"active_modules={len(param.ds_active_sub_modules)}, "
+                       f"in_release_set={param.ds_id in params_to_release}, "
+                       f"is_external={param.is_external_param}")
+            
             param.ds_active_sub_modules.discard(submodule.id)
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param)
@@ -547,6 +556,10 @@ class PartitionedParameterCoordinator:
     @compiler.disable
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
+        logger.info(f"[Release Attempt] Param {param.ds_id}: "
+                   f"status={param.ds_status}, "
+                   f"active_modules={len(param.ds_active_sub_modules)}")
+        
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             if self.release_to_cpu:
                 logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
