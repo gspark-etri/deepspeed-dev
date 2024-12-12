@@ -33,6 +33,8 @@ from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedO
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 
+from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator
+
 # Toggle this to true to enable correctness test
 # with gradient partitioning and without
 pg_correctness_test = False
@@ -158,6 +160,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
         zero_module_granularity_threshold=0,
+        release_to_cpu=False,
+        release_to_cpu_buffer_size=1e10,
+        release_to_cpu_pin_memory=False,
     ):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
@@ -212,6 +217,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.zero_hpz_partition_size > 1 and zero_param_parallel_group is None:
             self._set_zero_group_parallelism()
             zero_param_parallel_group = groups._get_zero_param_intra_parallel_group()
+
+        # CPU 캐시 관련 설정을 ds_config에 추가
+        if 'zero_optimization' not in ds_config:
+            ds_config['zero_optimization'] = {}
+        
+        zero_config = ds_config['zero_optimization']
+        if 'release_to_cpu' not in zero_config:
+            zero_config['release_to_cpu'] = release_to_cpu
+            zero_config['release_to_cpu_buffer_size'] = release_to_cpu_buffer_size
+            zero_config['release_to_cpu_pin_memory'] = release_to_cpu_pin_memory
 
         self.parameter_offload = self.initialize_ds_offload(
             module=module,
@@ -433,6 +448,20 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+
+        # CPU 관련 설정은 PartitionedParameterCoordinator에 위임
+        self.param_coordinator = PartitionedParameterCoordinator(
+            prefetch_bucket_sz=prefetch_bucket_size,
+            max_reuse_distance_in_numel=max_reuse_distance,
+            max_available_parameters_in_numel=max_live_parameters,
+            allgather_stream=get_accelerator().Stream(),
+            inflight_param_registry=self.parameter_offload.inflight_param_registry,
+            prefetch_nvme=False,
+            timers=timers,
+            zero_config=zero_config,  # 딕셔너리 형태의 zero_config 전달
+            zero_quantized_weights=zero_quantized_weights,
+            zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights
+        )
 
     def destroy(self):
         self.parameter_offload.destroy()
@@ -701,8 +730,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         param_groups: List[List[Parameter]] = tuple(
             self._create_fp16_sub_groups(param_group["params"]) for param_group in fp16_param_groups)
-
-        # bookkeeping related to param groups
         for param_group_idx, param_group in enumerate(param_groups):
             for sub_group in param_group:
                 sub_group_idx = len(self.fp16_groups)

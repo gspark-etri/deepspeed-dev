@@ -329,6 +329,22 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Override nn.Module apply function, for Stage 3.
     """
 
+    release_to_cpu: bool = Field(
+        default=False,
+        description="Whether to release parameters to CPU after use"
+    )
+
+    release_to_cpu_buffer_size: int = Field(
+        default=pp_int(1e10),
+        ge=0,
+        description="Maximum size of CPU buffer for released parameters"
+    )
+
+    release_to_cpu_pin_memory: bool = Field(
+        default=False,
+        description="Whether to use pinned memory for CPU buffer"
+    )
+
     # Validators
     @model_validator(mode="after")
     def overlap_comm_valid(self):
@@ -341,4 +357,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         offload_config = self.offload_optimizer
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
+        return self
+
+    @model_validator(mode="after")
+    def cpu_release_check(self):
+        """CPU release 관련 설정 검증"""
+        if self.release_to_cpu:
+            if self.release_to_cpu_buffer_size <= 0:
+                raise ValueError("release_to_cpu_buffer_size must be positive when release_to_cpu is enabled")
         return self

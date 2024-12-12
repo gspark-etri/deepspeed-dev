@@ -119,6 +119,11 @@ class DeepSpeedZeRoOffload(object):
         self.zero_quantized_weights = zero_quantized_weights
         self.zero_quantized_nontrainable_weights = zero_quantized_nontrainable_weights
 
+        if not hasattr(module, "ds_inflight_param_registry"):
+            module.ds_inflight_param_registry = InflightParamRegistry()
+        self.__inflight_param_registry = module.ds_inflight_param_registry
+        self.inflight_param_registry = self.__inflight_param_registry
+
         if offload_param_config is not None and offload_param_config.device != OffloadDeviceEnum.none:
             self.offload_device = offload_param_config.device
             self.offload_param_pin_memory = offload_param_config.pin_memory
@@ -140,10 +145,6 @@ class DeepSpeedZeRoOffload(object):
         self._max_available_parameters_in_numel = int(max_live_parameters)
         self.__allgather_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream(
         ) if overlap_comm else get_accelerator().default_stream()
-
-        if not hasattr(module, "ds_inflight_param_registry"):
-            module.ds_inflight_param_registry = InflightParamRegistry()
-        self.__inflight_param_registry = module.ds_inflight_param_registry
 
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,

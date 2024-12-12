@@ -85,6 +85,7 @@ class PartitionedParameterCoordinator:
         inflight_param_registry: InflightParamRegistry,
         prefetch_nvme: bool = False,
         timers=None,
+        zero_config=None,
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
     ) -> None:
@@ -129,6 +130,18 @@ class PartitionedParameterCoordinator:
         # TODO. make this configurable via JSON
         self.__max_ongoing_fetch_events: int = 2
         self.__profiler = PartitionedParameterProfiler(timers if ENABLE_PROFILER else None)
+
+        # CPU 캐시 관련 설정
+        self.release_to_cpu = zero_config.get('release_to_cpu', False) if zero_config else False
+        if self.release_to_cpu:
+            self.cpu_buffer_size = zero_config.get('release_to_cpu_buffer_size', 1e10)
+            self.pin_memory = zero_config.get('release_to_cpu_pin_memory', False)
+            self.cpu_param_cache = collections.OrderedDict()  # LRU 캐시
+            self.cpu_buffer_used = 0
+            self.param_access_stats = collections.defaultdict(int)  # 파라미터 접근 통계
+            self.cache_hits = 0
+            self.cache_misses = 0
+            logger.info(f"Initialized CPU cache with size {self.cpu_buffer_size/1e9:.2f}GB")
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -494,8 +507,47 @@ class PartitionedParameterCoordinator:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-release: {param.ds_summary()}")
+
+            if self.release_to_cpu:
+                self._manage_cpu_cache(param)
+            
             param.partition()
             self.__n_available_params -= param.ds_numel
+
+    def _manage_cpu_cache(self, param):
+        """CPU 캐시 관리 - LRU + Access Frequency 기반"""
+        param_size = param.ds_numel * param.element_size()
+        
+        # 캐시 공간 확보 
+        while self.cpu_buffer_used + param_size > self.cpu_buffer_size and self.cpu_param_cache:
+            # LRU + Access Frequency 정책
+            lru_params = sorted(self.param_access_stats.items(), 
+                              key=lambda x: (x[1], -list(self.cpu_param_cache.keys()).index(x[0])))
+            param_to_evict = lru_params[0][0]
+            
+            if param_to_evict in self.cpu_param_cache:
+                evicted_tensor = self.cpu_param_cache.pop(param_to_evict)
+                removed_size = evicted_tensor.numel() * evicted_tensor.element_size()
+                self.cpu_buffer_used -= removed_size
+                del self.param_access_stats[param_to_evict]
+                logger.debug(f"Evicted param {param_to_evict} from cache (size: {removed_size/1e6:.2f}MB)")
+
+        # 새 파라미터 캐시에 저장
+        try:
+            if self.pin_memory:
+                cached_tensor = param.data.cpu().pin_memory().clone()
+            else:
+                cached_tensor = param.data.cpu().clone()
+                
+            self.cpu_param_cache[param.ds_id] = cached_tensor
+            self.cpu_buffer_used += param_size
+            self.param_access_stats[param.ds_id] = 1
+            
+            logger.debug(f"Added param {param.ds_id} to cache "
+                        f"(size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
+                        
+        except RuntimeError as e:
+            logger.warning(f"Failed to cache param {param.ds_id}: {str(e)}")
 
     @instrument_w_nvtx
     @functools.lru_cache(maxsize=None)
