@@ -149,6 +149,22 @@ class PartitionedParameterCoordinator:
             self.cache_misses = 0
             logger.info(f"Initialized CPU cache with size {self.cpu_buffer_size/1e9:.2f}GB")
 
+        # 노드 내 GPU 그룹 설정
+        self.local_rank = dist.get_rank()
+        self.local_world_size = dist.get_world_size()
+        self.gpus_per_node = zero_config.get('gpus_per_node', 8) if zero_config else 8
+        self.node_id = self.local_rank // self.gpus_per_node
+        
+        # 노드 내 GPU 그룹 생성
+        node_start_rank = self.node_id * self.gpus_per_node
+        node_end_rank = min((self.node_id + 1) * self.gpus_per_node, self.local_world_size)
+        self.local_group = dist.new_group(ranks=list(range(node_start_rank, node_end_rank)))
+        
+        logger.info(f"[Init] Local group: node_id={self.node_id}, "
+                   f"local_rank={self.local_rank}, "
+                   f"gpus_per_node={self.gpus_per_node}, "
+                   f"group={self.local_group}")
+
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
     and passing trace results into constructor. This way all the code in here can
@@ -568,15 +584,33 @@ class PartitionedParameterCoordinator:
         #           f"release_to_cpu={self.release_to_cpu}")
         
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            if self.release_to_cpu:
+            # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
+            has_local_copy = self._check_local_copies(param)
+            
+            if has_local_copy and param.ds_status != ZeroParamStatus.AVAILABLE:
+                # AVAILABLE 상태가 아닐 때만 gather 시도
+                self._gather_from_local_gpus(param)
+            elif param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
+                # NVME offload 사용하는 경우
+                param.partition()
+            elif self.release_to_cpu:
+                # CPU로 이동
                 logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                 self._manage_cpu_cache(param)
-            param.partition()
+                param.partition()
 
     def _manage_cpu_cache(self, param):
-        """CPU 캐시 관리 - LRU + Access Frequency 기반"""
+        """CPU 캐시 관리 - 노드 내 GPU에 없는 파라미터만 캐시"""
+        # 노드 내 GPU에 파라미터가 있는지 확인
+        has_local_copy = self._check_local_copies(param)
+        
+        if has_local_copy:
+            logger.info(f"[Cache Skip] Param {param.ds_id} exists in local GPUs, skipping CPU cache")
+            return
+        
         param_size = param.ds_numel * param.element_size()
         
+        # 캐시 공간 확보
         while self.cpu_buffer_used + param_size > self.cpu_buffer_size and self.cpu_param_cache:
             lru_params = sorted(self.param_access_stats.items(), 
                               key=lambda x: (x[1], -list(self.cpu_param_cache.keys()).index(x[0])))
@@ -592,6 +626,7 @@ class PartitionedParameterCoordinator:
                 del self.param_access_stats[param_to_evict]
 
         try:
+            # 노드 내 GPU에 없는 파라미터만 캐시에 저장
             if self.pin_memory:
                 cached_tensor = param.data.cpu().pin_memory().clone()
             else:
@@ -700,3 +735,40 @@ class PartitionedParameterCoordinator:
         if not hasattr(param, 'ds_id'):
             return True
         return param.ds_status == ZeroParamStatus.AVAILABLE
+
+    def _check_local_copies(self, param: Parameter) -> bool:
+        """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
+        has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
+                               device=get_accelerator().device_name())
+        gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
+        
+        dist.all_gather(gathered, has_param, group=self.local_group)
+        return sum(g.item() for g in gathered) > 1
+
+    def _gather_from_local_gpus(self, param: Parameter) -> None:
+        """노드 내 GPU들과 파라미터 all-gather"""
+        logger.info(f"[Local Gather] Gathering param {param.ds_id} from node GPUs")
+        
+        # 이미 AVAILABLE 상태면 all_gather 건너뛰기
+        if param.ds_status == ZeroParamStatus.AVAILABLE:
+            logger.info(f"[Local Gather] Param {param.ds_id} already AVAILABLE, skipping gather")
+            return
+        
+        with get_accelerator().stream(self.__allgather_stream):
+            try:
+                # 파라미터가 분할된 상태인지 확인
+                if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                    # 분할된 상태에서만 all_gather 수행
+                    handle = param.all_gather_coalesced([param])
+                    if handle:
+                        handle.wait()
+                        param.ds_status = ZeroParamStatus.AVAILABLE
+                else:
+                    logger.warning(f"[Local Gather] Param {param.ds_id} in unexpected state: {param.ds_status}")
+                
+            except RuntimeError as e:
+                logger.warning(f"[Local Gather] Failed to gather param {param.ds_id}: {str(e)}")
+                # 실패 시 CPU 캐시로 폴백
+                if self.release_to_cpu:
+                    logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
+                    self._manage_cpu_cache(param)
