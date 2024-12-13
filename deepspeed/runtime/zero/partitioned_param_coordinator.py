@@ -309,7 +309,7 @@ class PartitionedParameterCoordinator:
 
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
-        """파라미터 fetch 최적화"""
+        """파라미터 fetch - stream 기반 최적화"""
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         unavailable_params = {p for p in params_to_fetch 
                              if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
@@ -319,46 +319,31 @@ class PartitionedParameterCoordinator:
         # 1. 파라미터 분류
         param_groups = self._group_parameters(unavailable_params)
         
-        # 2. 비동기 처리 시작
+        # 2. 파이프라인 처리 - 모든 작업을 비동기로 시작
         with torch.cuda.stream(self.__allgather_stream):
-            # 2.1 로컬 파라미터 처리 (비동기)
+            # 2.1 로컬 파라미터 처리
             if param_groups['local']:
-                handle = self._process_local_params(param_groups['local'])
-                if handle:
-                    handle.wait()  # wait() 사용
+                self._process_local_params(param_groups['local'])
             
-            # 2.2 캐시된 파라미터 복원 (비동기)
+            # 2.2 캐시된 파라미터 복원
             cached_failed = []
             if param_groups['cached']:
                 cached_failed = self._process_cached_params(param_groups['cached'])
             
-            # 2.3 리모트 파라미터 처리 (비동기)
+            # 2.3 리모트 파라미터 처리
             remote_params = param_groups['remote'] + cached_failed
             if remote_params:
-                # 모든 프로세스가 동시에 all_gather 시작
-                dist.barrier()  # 동기화 지점
-                
-                # 배치 크기로 나누어 처리
-                batch_size = 4
-                for i in range(0, len(remote_params), batch_size):
-                    batch = remote_params[i:i+batch_size]
-                    handle = self.__all_gather_params(batch, forward)
-                    if handle:
-                        handle.wait()  # 각 배치 완료 대기
-                        
-                    # 스트림 동기화
-                    if not get_accelerator().resolves_data_dependency():
-                        get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+                self.__all_gather_params(remote_params, forward)
             
-            # 3. 결과 검증
-            failed_params = []
-            for param in unavailable_params:
-                if param.ds_status != ZeroParamStatus.AVAILABLE:
-                    failed_params.append(param)
-                    logger.error(f"Parameter {param.ds_id} not available after fetch")
+            # 2.4 모든 파라미터가 준비될 때까지 대기
+            self._wait_for_batch(remote_params)
             
-            if failed_params:
-                raise RuntimeError(f"Failed to fetch {len(failed_params)} parameters")
+            # 2.5 스트림 동기화 (필요한 경우만)
+            if not get_accelerator().resolves_data_dependency():
+                get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+
+        # 3. 결과 검증
+        self._verify_params(params_to_fetch, current_submodule)
 
     def _group_parameters(self, params):
         """파라미터를 특성별로 그룹화"""
@@ -381,49 +366,44 @@ class PartitionedParameterCoordinator:
         return groups
 
     def _process_local_params(self, params):
-        """로컬 파라미터 비동기 처리"""
+        """로컬 파라미터 처리 - 비동기 all_gather"""
         if not params:
-            return None
+            return
         
         logger.info(f"Processing {len(params)} local parameters")
-        return params[0].all_gather_coalesced(params)  # 비동기 핸들 반환
+        # 노동기 all_gather
+        handle = params[0].all_gather_coalesced(params)
+        if handle:
+            # 완료 대기
+            handle.wait()
+            for param in params:
+                param.ds_status = ZeroParamStatus.AVAILABLE
 
     def _process_cached_params(self, params):
-        """CPU 캐시에서 필요한 GPU로 파라미터 복원"""
+        """CPU 캐시에서 파라미터 복원 - 비동기 처리"""
         if not params:
             return []
         
         logger.info(f"Restoring {len(params)} cached parameters")
         failed_params = []
         
-        # 메인 스트림과 겹치지 않도록 별도의 스트림 사용
-        with torch.cuda.stream(self.__allgather_stream):
-            for param in params:
-                try:
-                    cached_tensor = self.cpu_param_cache[param.ds_id]
-                    
-                    # 현재 GPU가 이 파라미터를 담당하는지 확인
-                    responsible_gpu = param.ds_id % self.gpus_per_node
-                    current_gpu = dist.get_rank() % self.gpus_per_node
-                    
-                    if responsible_gpu == current_gpu:
-                        # GPU로 이동
-                        param.data = cached_tensor.cuda(non_blocking=True)
-                        param.ds_status = ZeroParamStatus.AVAILABLE
-                        
-                        # 캐시 정리
-                        self.param_access_stats[param.ds_id] += 1
-                        self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
-                        del self.cpu_param_cache[param.ds_id]
-                        
-                    logger.info(f"[Cache Restore] Completed for param {param.ds_id}")
-                    
-                except Exception as e:
-                    logger.warning(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}")
-                    failed_params.append(param)
-                    # 실패한 파라미터는 캐시에서 제거
-                    if param.ds_id in self.cpu_param_cache:
-                        del self.cpu_param_cache[param.ds_id]
+        for param in params:
+            try:
+                cached_tensor = self.cpu_param_cache[param.ds_id]
+                # 비동기로 GPU로 이동
+                param.data = cached_tensor.cuda(non_blocking=True)
+                param.ds_status = ZeroParamStatus.AVAILABLE
+                
+                # 캐시 정리
+                self.param_access_stats[param.ds_id] += 1
+                self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
+                del self.cpu_param_cache[param.ds_id]
+                
+            except Exception as e:
+                logger.warning(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}")
+                failed_params.append(param)
+                if param.ds_id in self.cpu_param_cache:
+                    del self.cpu_param_cache[param.ds_id]
         
         return failed_params
 
