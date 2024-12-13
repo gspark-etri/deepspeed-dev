@@ -748,57 +748,33 @@ class PartitionedParameterCoordinator:
         return param.ds_status == ZeroParamStatus.AVAILABLE
 
     def _check_local_copies(self, param: Parameter) -> Tuple[bool, bool]:
-        """파라미터가 로컬/리모트 GPU에 있는지 확인
+        """파라미터가 로컬/리모트 GPU에 있는지 확인 (메타데이터만 사용)
         Returns:
             Tuple[bool, bool]: (local_exists, remote_exists)
         """
         try:
-            world_size = dist.get_world_size()
             world_rank = dist.get_rank()
             node_rank = world_rank // self.gpus_per_node
-            local_rank = world_rank % self.gpus_per_node
-            num_nodes = world_size // self.gpus_per_node
             
-            has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
-                                   device=get_accelerator().device_name())
-            gathered = [torch.zeros_like(has_param) for _ in range(world_size)]
+            # 파라미터의 소유권 정보 확인 (메타데이터)
+            param_owner = param.ds_id % dist.get_world_size()
+            owner_node = param_owner // self.gpus_per_node
             
-            try:
-                # 먼저 NCCL로 시도
-                dist.all_gather(gathered, has_param, group=None)  # 전체 world에 대해 수행
-            except Exception as nccl_error:
-                logger.warning(f"[Local Check] NCCL failed for param {param.ds_id}, falling back to CPU: {str(nccl_error)}")
-                # CPU로 폴백
-                has_param_cpu = has_param.cpu()
-                gathered_cpu = [torch.zeros_like(has_param_cpu) for _ in range(world_size)]
-                dist.all_gather(gathered_cpu, has_param_cpu, group=None)
-                gathered = [t.to(get_accelerator().device_name()) for t in gathered_cpu]
+            # 현재 노드에 있는지 확인
+            local_exists = (owner_node == node_rank)
+            # 다른 노드에 있는지 확인 
+            remote_exists = not local_exists
             
-            # 같은 노드의 GPU들만 체크
-            node_start = node_rank * self.gpus_per_node
-            node_end = node_start + self.gpus_per_node
-            
-            # 현재 노드의 다른 GPU들 중에서 파라미터를 가진 GPU가 있는지 확인
-            local_gpus_have_param = sum(g.item() for i, g in enumerate(gathered[node_start:node_end]) 
-                                      if i != local_rank) > 0
-            
-            if local_gpus_have_param:
+            if local_exists:
                 logger.debug(f"[Param {param.ds_id}] Found in local node (node {node_rank})")
-                return True
+            else:
+                logger.debug(f"[Param {param.ds_id}] Found in remote node {owner_node}")
             
-            # 다른 노드들의 GPU도 체크하여 로깅
-            for n in range(num_nodes):
-                if n != node_rank:
-                    n_start = n * self.gpus_per_node
-                    n_end = n_start + self.gpus_per_node
-                    if any(g.item() for g in gathered[n_start:n_end]):
-                        logger.debug(f"[Param {param.ds_id}] Found in remote node {n}")
-            
-            return local_gpus_have_param
+            return local_exists, remote_exists
             
         except Exception as e:
-            logger.warning(f"[Local Check] All attempts failed for param {param.ds_id}: {str(e)}")
-            return False
+            logger.warning(f"[Local Check] Failed for param {param.ds_id}: {str(e)}")
+            return False, False
 
     def _gather_from_local_gpus(self, param: Parameter) -> None:
         """노드 내 GPU들과 파라미터 all-gather"""
