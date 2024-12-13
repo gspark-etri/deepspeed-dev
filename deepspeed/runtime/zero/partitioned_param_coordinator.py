@@ -21,6 +21,7 @@ import deepspeed.runtime.compiler as compiler
 from deepspeed.runtime.compiler import is_compiling
 
 import logging
+import traceback
 
 ENABLE_PROFILER = False
 
@@ -395,6 +396,12 @@ class PartitionedParameterCoordinator:
                 
             self.__profiler.stop_event(event_name, fetch_numel)
 
+        if not forward:  # backward 단계일 때 추가 로깅
+            logger.info(f"[Backward] Starting fetch for module {current_submodule.__class__.__name__}")
+            for param in params_to_fetch:
+                logger.info(f"[Backward] Param {param.ds_id}: status={param.ds_status}, "
+                           f"in_cache={param.ds_id in self.cpu_param_cache}")
+
     @instrument_w_nvtx
     @torch.no_grad()
     def release_sub_module(self, submodule: Module) -> None:
@@ -613,25 +620,30 @@ class PartitionedParameterCoordinator:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
 
     def _restore_from_cache(self, param):
-        """CPU 캐시에서 파라미터 복원 개선"""
-        cached_tensor = self.cpu_param_cache[param.ds_id]
+        """CPU 캐시에서 파라미터 복원"""
+        logger.info(f"[Cache Restore] Starting for param {param.ds_id}")
         
-        # 1. GPU 메모리 명시적 관리
-        if hasattr(param, 'gpu_buffer'):
-            del param.gpu_buffer
-        
-        # 2. 동기화 보장
-        with torch.cuda.stream(self.__allgather_stream):
-            param.data = cached_tensor.cuda(non_blocking=True)
-        
-        # 3. 캐시 상태 업데이트
-        param.ds_status = ZeroParamStatus.AVAILABLE
-        self.param_access_stats[param.ds_id] += 1
-        
-        # 4. CPU 메모리 관리
-        self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
-        del self.cpu_param_cache[param.ds_id]
-        del cached_tensor
+        try:
+            cached_tensor = self.cpu_param_cache[param.ds_id]
+            logger.info(f"[Cache Restore] Found cached tensor for param {param.ds_id}")
+            
+            with torch.cuda.stream(self.__allgather_stream):
+                param.data = cached_tensor.cuda(non_blocking=True)
+                logger.info(f"[Cache Restore] Moved param {param.ds_id} to GPU")
+            
+            param.ds_status = ZeroParamStatus.AVAILABLE
+            self.param_access_stats[param.ds_id] += 1
+            
+            self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
+            del self.cpu_param_cache[param.ds_id]
+            del cached_tensor
+            
+            logger.info(f"[Cache Restore] Completed for param {param.ds_id}")
+            
+        except Exception as e:
+            logger.error(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}\n"
+                        f"Stack trace: {traceback.format_exc()}")
+            raise
 
     def post_backward_hook(self, param):
         """파라미터 업데이트 후 CPU 캐시 동기화"""
@@ -718,7 +730,11 @@ class PartitionedParameterCoordinator:
                     self._manage_cpu_cache(param)
 
     def _wait_for_params(self, params_to_fetch, current_submodule, forward):
-        """Wait for all in-flight parameter requests to complete."""
+        """Wait for parameters with detailed logging"""
+        if not forward:
+            logger.info(f"[Backward Wait] Starting for module {current_submodule.__class__.__name__}")
+            logger.info(f"[Backward Wait] Inflight params: {[p.ds_id for p in self.__inflight_param_registry]}")
+        
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)
