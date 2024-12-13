@@ -328,61 +328,33 @@ class PartitionedParameterCoordinator:
 
         params_to_fetch = frozenset(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         
-        event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
-        fetch_numel = sum([p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+        # 파라미터 상태 추적을 위한 set
+        processed_params = set()
         
-        if fetch_numel > 0:
-            self._dump_param_ids(event_name, current_submodule.id,
-                               [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
-            self.__profiler.start_event(event_name)
-            
-            local_params = []
-            cached_params = []
-            remote_params = []
-            
-            # 먼저 모든 파라미터를 분류
-            for param in params_to_fetch:
-                if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                    # 1. 로컬/리모트 GPU 체크
-                    local_exists = self._check_local_copies(param)
+        for param in params_to_fetch:
+            if param.ds_id in processed_params:
+                continue  # 이미 처리된 파라미터는 건너뛰기
+                
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                # 1. 로컬 GPU에서 가져오기 시도
+                if self._check_local_copies(param):
+                    self._gather_from_local_gpus(param)
+                    processed_params.add(param.ds_id)
+                    continue
                     
-                    if local_exists:
-                        local_params.append(param)
-                        continue
-                        
-                    # 2. CPU 캐시 체크
-                    if self.release_to_cpu and param.ds_id in self.cpu_param_cache:
-                        cached_params.append(param)
-                        self.cache_hits += 1
-                        continue
-                        
-                    # 3. 리모트 GPU 체크
-                    remote_params.append(param)
-                    self.cache_misses += 1
-
-            # 1. 로컬 파라미터 처리 (가장 빠름)
-            if local_params:
-                logger.info(f"[{event_name}] Processing {len(local_params)} local parameters")
-                with get_accelerator().stream(self.__allgather_stream):
-                    handle = local_params[0].all_gather_coalesced(local_params)
-                    if handle:
-                        handle.wait()
-                        for param in local_params:
-                            param.ds_status = ZeroParamStatus.AVAILABLE
-                            logger.debug(f"[Param {param.ds_id}] Status after local gather: {param.ds_status}")
-                    
-            # 2. CPU 캐시에서 복원 (중간)
-            if cached_params:
-                logger.info(f"[{event_name}] Restoring {len(cached_params)} cached parameters")
-                for param in cached_params:
+                # 2. CPU 캐시에서 복원 시도
+                if self.release_to_cpu and param.ds_id in self.cpu_param_cache:
                     self._restore_from_cache(param)
+                    processed_params.add(param.ds_id)
+                    continue
                     
-            # 3. 리모트 파라미터 처리 (가장 느림)
-            if remote_params:
-                logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters")
-                self.__all_gather_params(remote_params, forward)
-            
-            self.__profiler.stop_event(event_name, fetch_numel)
+                # 3. 리모트에서 가져오기
+                self.__all_gather_params([param], forward)
+                processed_params.add(param.ds_id)
+
+        # 처리 완료 대기
+        if self.__inflight_param_registry:
+            self._wait_for_params()
 
         # Wait 로직 유지
         wait_numel = 0
@@ -582,27 +554,25 @@ class PartitionedParameterCoordinator:
     @compiler.disable
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
-        if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
-            try:
-                # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
-                has_local_copy = self._check_local_copies(param)
-                
-                if has_local_copy:
-                    # 로컬에 있으면 partition만 수행
-                    logger.info(f"[Local Keep] Param {param.ds_id} exists in other local GPUs")
-                    param.partition()
-                elif self.release_to_cpu:
-                    # 로컬에 없고 CPU 캐시 사용 가능하면 CPU로 이동
-                    logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
+        if param.ds_status != ZeroParamStatus.AVAILABLE or param.ds_active_sub_modules:
+            return
+        
+        try:
+            # 현재 GPU가 이 파라미터를 담당하는지 확인
+            responsible_gpu = self._get_responsible_gpu(param)
+            if responsible_gpu == dist.get_rank() % self.gpus_per_node:
+                # CPU 캐시로 이동
+                if self.release_to_cpu:
                     self._manage_cpu_cache(param)
-                    param.partition()
-                else:
-                    # 그 외의 경우는 partition만 수행
-                    param.partition()
-                    
-            except Exception as e:
-                logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
-                param.partition()
+            else:
+                # 다른 GPU가 담당하면 partition만
+                logger.debug(f"[Release] Param {param.ds_id} handled by GPU {responsible_gpu}")
+                
+            param.partition()
+                
+        except Exception as e:
+            logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
+            param.partition()
 
     def _manage_cpu_cache(self, param):
         """CPU 캐시 관리 - 담당 GPU만 캐시 수행"""
