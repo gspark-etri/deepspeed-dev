@@ -385,20 +385,56 @@ class PartitionedParameterCoordinator:
                 param.ds_status = ZeroParamStatus.AVAILABLE
 
     def _process_cached_params(self, params):
-        """캐시된 파라미터 비동기 복원"""
+        """CPU 캐시에서 필요한 GPU로 파라미터 복원
+        - 메인 스트림에서 실행되는 다른 연산과 겹치지 않도록 별도의 스트림 사용
+        - 로컬 노드 내 GPU 간 파라미터 분배만 처리
+        """
         if not params:
             return None
         
         logger.info(f"Restoring {len(params)} cached parameters")
-        cache_stream = torch.cuda.Stream()
         
-        with torch.cuda.stream(cache_stream):
+        # 메인 스트림과 겹치지 않도록 별도의 스트림 사용
+        with torch.cuda.stream(self.__allgather_stream):
             for param in params:
-                self._restore_from_cache(param)
-                
+                try:
+                    cached_tensor = self.cpu_param_cache[param.ds_id]
+                    
+                    # 현재 GPU가 이 파라미터를 담당하는지 확인
+                    responsible_gpu = self._get_responsible_gpu(param)
+                    current_gpu = dist.get_rank() % self.gpus_per_node
+                    
+                    if responsible_gpu == current_gpu:
+                        # 담당 GPU인 경우 캐시에서 로드
+                        param.data = cached_tensor.cuda(non_blocking=True)
+                        param.ds_status = ZeroParamStatus.AVAILABLE
+                        
+                        # 캐시 정리
+                        self.param_access_stats[param.ds_id] += 1
+                        self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
+                        del self.cpu_param_cache[param.ds_id]
+                        
+                    logger.info(f"[Cache Restore] Completed for param {param.ds_id}")
+                    
+                except Exception as e:
+                    logger.error(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}")
+                    raise
+        
+        # 스트림 동기화를 위한 이벤트 반환
         event = torch.cuda.Event()
-        event.record(cache_stream)
+        event.record(self.__allgather_stream)
         return event
+
+    def _needs_parameter(self, param: Parameter) -> bool:
+        """현재 GPU가 이 파라미터를 필요로 하는지 확인"""
+        world_rank = dist.get_rank()
+        local_rank = world_rank % self.gpus_per_node
+        
+        # 파라미터 소유권 또는 계산에 필요한지 확인
+        is_owner = param.ds_id % dist.get_world_size() == world_rank
+        needs_computation = param.ds_active_sub_modules or param.requires_grad
+        
+        return is_owner or needs_computation
 
     def _process_remote_params(self, params, forward):
         """리모트 파라미터 배치 처리"""
@@ -654,7 +690,9 @@ class PartitionedParameterCoordinator:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
 
     def _restore_from_cache(self, param):
-        """CPU 캐시에서 파라미터 복원"""
+        """
+        이 함수는 더 이상 stream 관리를 하지 않음 - 호출하는 쪽에서 관리
+        """
         logger.info(f"[Cache Restore] Starting for param {param.ds_id}")
         
         try:
@@ -666,13 +704,12 @@ class PartitionedParameterCoordinator:
                 logger.info(f"[Cache Restore] Param {param.ds_id} is remote, syncing with other nodes")
                 dist.broadcast(cached_tensor, src=param.ds_id % dist.get_world_size())
             
-            with torch.cuda.stream(self.__allgather_stream):
-                param.data = cached_tensor.cuda(non_blocking=True)
-                logger.info(f"[Cache Restore] Moved param {param.ds_id} to GPU")
-            
+            # 호출하는 쪽의 stream context에서 실행됨
+            param.data = cached_tensor.cuda(non_blocking=True)
             param.ds_status = ZeroParamStatus.AVAILABLE
-            self.param_access_stats[param.ds_id] += 1
             
+            # 캐시 정리
+            self.param_access_stats[param.ds_id] += 1
             self.cpu_buffer_used -= cached_tensor.numel() * cached_tensor.element_size()
             del self.cpu_param_cache[param.ds_id]
             del cached_tensor
