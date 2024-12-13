@@ -344,7 +344,7 @@ class PartitionedParameterCoordinator:
             for param in params_to_fetch:
                 if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                     # 1. 로컬/리모트 GPU 체크
-                    local_exists, remote_exists = self._check_local_copies(param)
+                    local_exists = self._check_local_copies(param)
                     
                     if local_exists:
                         local_params.append(param)
@@ -357,8 +357,6 @@ class PartitionedParameterCoordinator:
                         continue
                         
                     # 3. 리모트 GPU 체크
-                    if remote_exists:
-                        logger.info(f"[Remote] Param {param.ds_id} found in remote node")
                     remote_params.append(param)
                     self.cache_misses += 1
 
@@ -587,27 +585,19 @@ class PartitionedParameterCoordinator:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             try:
                 # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
-                has_local_copy = self._check_local_copies(param)
+                has_local_copy = self._check_local_copies(param)  # bool 값 반환
                 
                 if has_local_copy:
-                    # 다른 GPU에 있어도 partition은 해야 함
                     logger.info(f"[Local Keep] Param {param.ds_id} exists in other local GPUs")
-                    param.partition()
-                elif param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
-                    # NVME offload 사용하는 경우
-                    param.partition()
                 elif self.release_to_cpu:
                     # CPU로 이동
                     logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                     self._manage_cpu_cache(param)
-                    param.partition()
-                else:
-                    # 기본적으로는 partition 수행
-                    param.partition()
+
+                param.partition()
                 
             except Exception as e:
                 logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
-                # 에러 발생 시 기본 동작 - partition
                 param.partition()
 
     def _manage_cpu_cache(self, param):
@@ -747,11 +737,8 @@ class PartitionedParameterCoordinator:
             return True
         return param.ds_status == ZeroParamStatus.AVAILABLE
 
-    def _check_local_copies(self, param: Parameter) -> Tuple[bool, bool]:
-        """파라미터가 로컬/리모트 GPU에 있는지 확인 (메타데이터만 사용)
-        Returns:
-            Tuple[bool, bool]: (local_exists, remote_exists)
-        """
+    def _check_local_copies(self, param: Parameter) -> bool:
+        """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
         try:
             world_rank = dist.get_rank()
             node_rank = world_rank // self.gpus_per_node
@@ -762,19 +749,17 @@ class PartitionedParameterCoordinator:
             
             # 현재 노드에 있는지 확인
             local_exists = (owner_node == node_rank)
-            # 다른 노드에 있는지 확인 
-            remote_exists = not local_exists
             
             if local_exists:
                 logger.debug(f"[Param {param.ds_id}] Found in local node (node {node_rank})")
             else:
                 logger.debug(f"[Param {param.ds_id}] Found in remote node {owner_node}")
             
-            return local_exists, remote_exists
+            return local_exists
             
         except Exception as e:
             logger.warning(f"[Local Check] Failed for param {param.ds_id}: {str(e)}")
-            return False, False
+            return False
 
     def _gather_from_local_gpus(self, param: Parameter) -> None:
         """노드 내 GPU들과 파라미터 all-gather"""
