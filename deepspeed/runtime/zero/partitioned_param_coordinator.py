@@ -328,136 +328,65 @@ class PartitionedParameterCoordinator:
 
         params_to_fetch = frozenset(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         
-        # 파라미터 상태 추적을 위한 set
-        processed_params = set()
+        event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
+        fetch_numel = sum([p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
         
-        for param in params_to_fetch:
-            if param.ds_id in processed_params:
-                continue  # 이미 처리된 파라미터는 건너뛰기
-                
-            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                # 1. 로컬 GPU에서 가져오기 시도
-                if self._check_local_copies(param):
-                    self._gather_from_local_gpus(param)
-                    processed_params.add(param.ds_id)
-                    continue
+        if fetch_numel > 0:
+            self._dump_param_ids(event_name, current_submodule.id,
+                               [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
+            self.__profiler.start_event(event_name)
+            
+            local_params = []
+            cached_params = []
+            remote_params = []
+            
+            # 먼저 모든 파라미터를 분류
+            for param in params_to_fetch:
+                if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                    # 1. 로컬/리모트 GPU 체크
+                    local_exists = self._check_local_copies(param)
                     
-                # 2. CPU 캐시에서 복원 시도
-                if self.release_to_cpu and param.ds_id in self.cpu_param_cache:
-                    self._restore_from_cache(param)
-                    processed_params.add(param.ds_id)
-                    continue
-                    
-                # 3. 리모트에서 가져오기
-                self.__all_gather_params([param], forward)
-                processed_params.add(param.ds_id)
+                    if local_exists:
+                        local_params.append(param)
+                        continue
+                        
+                    # 2. CPU 캐시 체크
+                    if self.release_to_cpu and param.ds_id in self.cpu_param_cache:
+                        cached_params.append(param)
+                        self.cache_hits += 1
+                        continue
+                        
+                    # 3. 리모트 GPU 체크
+                    remote_params.append(param)
+                    self.cache_misses += 1
 
-        # 처리 완료 대기
-        if self.__inflight_param_registry:
-            self._wait_for_params()
-
-        # Wait 로직 유지
-        wait_numel = 0
-        wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
-        self.__profiler.start_event(wait_event_name)
-        # wait for parameters in the immediately needed submodule to become available
-        for param in params_to_fetch:
-            param.ds_active_sub_modules.add(current_submodule.id)
-            if logger.isEnabledFor(logging.DEBUG):
-                debug_rank0(f"-wait: {param.ds_summary()}")
-            if param in self.__inflight_param_registry:
-                wait_numel += param.partition_numel()
+            # 1. 로컬 파라미터 처리 (가장 빠름)
+            if local_params:
+                logger.info(f"[{event_name}] Processing {len(local_params)} local parameters")
                 with get_accelerator().stream(self.__allgather_stream):
-                    while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
-                        self.__ongoing_fetch_events.popleft()
-                    if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events:
-                        self.__ongoing_fetch_events.popleft().synchronize()
-
-                    self.__inflight_param_registry.pop(param).wait()
-
-                    if not get_accelerator().handles_memory_backpressure():
-                        event = get_accelerator().Event()
-                        event.record()
-                        self.__ongoing_fetch_events.append(event)
-
-            assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
-        if not get_accelerator().resolves_data_dependency():
-            get_accelerator().current_stream().wait_stream(self.__allgather_stream)
-        self.__profiler.stop_event(wait_event_name, wait_numel)
-
-        # kick off parameter prefetches for upcoming modules
-        # don't prefetch if we dont have a completed model trace
-        if self.is_complete_trace():
-            # go through the parameters we need for the current module and pop them
-            # off the fetch queue so that they aren't prefetched later.
-            # if params have already been popped off the fetch queue by earlier
-            # prefetches we won't look for them here
-            discarded_from_prefetch_queue = set()
-            params_not_already_fetched = set(
-                filter(lambda p: self.__most_recent_step_id_param_fetched_for[p] < self.__step_id, params_to_fetch))
-            while self.__param_queue and len(discarded_from_prefetch_queue) < len(params_not_already_fetched):
-                param_in_trace = self.__param_queue.popleft()
-                self.__most_recent_step_id_param_fetched_for[
-                    param_in_trace.param] = param_in_trace.step_id_last_used_at
-                discarded_from_prefetch_queue.add(param_in_trace.param)
-
-            if discarded_from_prefetch_queue != params_not_already_fetched:
-                raise RuntimeError(
-                    f"tracing error at step {self.__step_id}: \n"
-                    f"module id: {current_submodule.id}, training: {current_submodule.training}\n"
-                    f"expected the next {len(params_not_already_fetched)} parameters in the "
-                    f"parameter fetch queue to be {tuple(p.ds_summary(use_debug_name=True) for p in params_not_already_fetched)} \n"
-                    f"but got \n {tuple(p.ds_summary(use_debug_name=True) for p in discarded_from_prefetch_queue)}.")
-
-            def _is_currently_on_nvme(param):
-                if param.nvme_swapper is None:
-                    return False
-
-                return param.ds_tensor.final_location == OffloadDeviceEnum.nvme \
-                    and param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
-
-            # kick off all gather for params in the next few submodules (prefetch)
-            if self.__prefetch_bucket_sz > 0:
-                max_params_to_prefetch = min(self.__max_n_available_params - self.__n_available_params,
-                                             self.__prefetch_bucket_sz)
-                params_to_prefetch = set()
-                numel_prefetching = 0
-                while self.__param_queue and numel_prefetching < max_params_to_prefetch:
-                    param_in_trace: __class__.__ParamInTrace = self.__param_queue.popleft()
-
-                    if _is_currently_on_nvme(param_in_trace.param):
-                        # nvme prefetch is handled elsewhere. Need to break here to preserve fetch order
-                        self.__param_queue.appendleft(param_in_trace)
-                        break
-
-                    do_prefetch = param_in_trace.param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-                    if param_in_trace.param in params_to_prefetch:
-                        # Avoid duplicates
-                        do_prefetch = False
-
-                    self.__most_recent_step_id_param_fetched_for[param_in_trace.param] = \
-                        max(self.__most_recent_step_id_param_fetched_for[param_in_trace.param],
-                            param_in_trace.step_id_last_used_at)
-
-                    if do_prefetch:
-                        params_to_prefetch.add(param_in_trace.param)
-                        numel_prefetching += param_in_trace.param.ds_numel
-
-                if numel_prefetching > 0:
-                    event_name = __class__.FORWARD_PREFETCH_SUBMIT if forward else __class__.BACKWARD_PREFETCH_SUBMIT
-                    self.__profiler.start_event(event_name)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        for param in params_to_prefetch:
-                            debug_rank0(f"-prefetch: {param.ds_summary()}")
-                    self.__all_gather_params(params_to_prefetch, forward)
-                    self.__profiler.stop_event(event_name, numel_prefetching)
-
-                if self.__prefetch_nvme:
-                    self.__prefetch_nvme_param_partitions()
-
-        self.__step_id += 1
-        
-        #logger.info(f"=== Completed {phase} for module: {current_submodule.__class__.__name__} ===")
+                    handle = local_params[0].all_gather_coalesced(local_params)
+                    if handle:
+                        handle.wait()
+                        for param in local_params:
+                            param.ds_status = ZeroParamStatus.AVAILABLE
+                            logger.debug(f"[Param {param.ds_id}] Status after local gather: {param.ds_status}")
+                    
+            # 2. CPU 캐시에서 복원 (중간)
+            if cached_params:
+                logger.info(f"[{event_name}] Restoring {len(cached_params)} cached parameters")
+                for param in cached_params:
+                    self._restore_from_cache(param)
+                    
+            # 3. 리모트 파라미터 처리 (가장 느림)
+            if remote_params:
+                logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters")
+                self.__all_gather_params(remote_params, forward)
+                
+            # 처리 완료 대기
+            if self.__inflight_param_registry:
+                self.__wait_for_params()
+                
+            self.__profiler.stop_event(event_name, fetch_numel)
 
     @instrument_w_nvtx
     @torch.no_grad()
