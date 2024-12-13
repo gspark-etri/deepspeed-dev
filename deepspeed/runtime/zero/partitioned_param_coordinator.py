@@ -323,25 +323,36 @@ class PartitionedParameterCoordinator:
         
         # 1. 파라미터 분류 및 배치화
         param_groups = self._group_parameters(unavailable_params)
-        failed_params = []  # 캐시 복원 실패한 파라미터들
         
         # 2. 파이프라인 처리
         with torch.cuda.stream(self.__allgather_stream):
-            # 2.1 로컬 파라미터 처리 (비동기)
+            # 2.1 로컬 파라미터 처리
             if param_groups['local']:
                 self._process_local_params(param_groups['local'])
                 
-            # 2.2 캐시된 파라미터 복원 (비동기)
+            # 2.2 캐시된 파라미터 복원
+            cached_failed = []
             if param_groups['cached']:
-                failed_params.extend(self._process_cached_params(param_groups['cached']))
+                cached_failed = self._process_cached_params(param_groups['cached'])
                 
-            # 2.3 리모트 파라미터와 실패한 파라미터들 all_gather로 처리
-            params_to_gather = param_groups['remote'] + failed_params
-            if params_to_gather:
-                logger.info(f"Gathering {len(params_to_gather)} parameters ({len(failed_params)} from failed cache restore)")
-                self.__all_gather_params(params_to_gather, forward)
-                self._wait_for_batch(params_to_gather)
+            # 2.3 모든 리모트/실패한 파라미터를 한 번에 처리
+            remote_params = param_groups['remote'] + cached_failed
+            if remote_params:
+                # 크기별로 정렬하여 배치 처리
+                remote_params.sort(key=lambda p: p.partition_numel(), reverse=True)
+                batch_size = min(4, len(remote_params))  # 큰 파라미터는 더 작은 배치로
                 
+                for i in range(0, len(remote_params), batch_size):
+                    batch = remote_params[i:i+batch_size]
+                    logger.info(f"Gathering batch of {len(batch)} parameters")
+                    self.__all_gather_params(batch, forward)
+                    # 각 배치가 완료될 때까지 대기
+                    self._wait_for_batch(batch)
+                    
+                    # 스트림 동기화
+                    if not get_accelerator().resolves_data_dependency():
+                        get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+            
         # 3. 결과 검증
         self._verify_params(params_to_fetch, current_submodule)
         self.__profiler.stop_event(event_name, fetch_numel)
