@@ -328,7 +328,6 @@ class PartitionedParameterCoordinator:
 
         params_to_fetch = frozenset(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         
-        # 프로파일링 시작
         event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
         fetch_numel = sum([p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
         
@@ -337,46 +336,45 @@ class PartitionedParameterCoordinator:
                                [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
             self.__profiler.start_event(event_name)
             
-            if self.release_to_cpu:
-                local_params = []
-                remote_params = []
-                restored_from_cache = []
-                
-                for param in params_to_fetch:
-                    if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                        if param.ds_id in self.cpu_param_cache:
-                            logger.info(f"[Cache Hit] Param {param.ds_id} found in CPU cache "
-                                      f"(access count: {self.param_access_stats[param.ds_id]})")
-                            self._restore_from_cache(param)
-                            restored_from_cache.append(param)
-                            self.cache_hits += 1
-                        elif self._is_local_parameter(param):
-                            local_params.append(param)
-                        else:
-                            remote_params.append(param)
-                            self.cache_misses += 1
-
-                # 캐시 통계는 히트가 있을 때만 출력
-                if restored_from_cache:
-                    hit_rate = len(restored_from_cache) / len(params_to_fetch) * 100
-                    logger.info(f"[Cache Stats] Module {current_submodule.__class__.__name__}: "
-                              f"hit rate {hit_rate:.1f}% ({len(restored_from_cache)}/{len(params_to_fetch)})")
-
-                # 로컬/리모트 파라미터 처리
-                if local_params:
-                    logger.info(f"[{event_name}] Processing {len(local_params)} local parameters")
-                    self.__all_gather_params(local_params, forward)
+            local_params = []
+            remote_params = []
+            restored_from_cache = []
+            
+            # 먼저 모든 파라미터를 분류
+            for param in params_to_fetch:
+                if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                    # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
+                    has_local_copy = self._check_local_copies(param)
+                    logger.debug(f"[Param {param.ds_id}] Status: {param.ds_status}, Has local copy: {has_local_copy}")
                     
-                if remote_params:
-                    try:
-                        logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters via all-gather")
-                        self.__all_gather_params(remote_params, forward)
-                    except Exception as e:
-                        logger.warning(f"[{event_name}] All-gather failed, using CPU path: {str(e)}")
-                        self.__fetch_remote_params_via_cpu(remote_params)
-                        
-            else:
-                self.__all_gather_params(params_to_fetch, forward)
+                    if has_local_copy:
+                        logger.info(f"[Local Copy] Param {param.ds_id} found in local GPUs")
+                        local_params.append(param)
+                    elif self.release_to_cpu and param.ds_id in self.cpu_param_cache:
+                        logger.info(f"[Cache Hit] Param {param.ds_id} found in CPU cache")
+                        self._restore_from_cache(param)
+                        restored_from_cache.append(param)
+                        self.cache_hits += 1
+                    else:
+                        logger.info(f"[Remote] Param {param.ds_id} not found locally")
+                        remote_params.append(param)
+                        self.cache_misses += 1
+
+            # 로컬 파라미터 한번에 처리
+            if local_params:
+                logger.info(f"[{event_name}] Processing {len(local_params)} local parameters via local gather")
+                with get_accelerator().stream(self.__allgather_stream):
+                    handle = local_params[0].all_gather_coalesced(local_params)
+                    if handle:
+                        handle.wait()
+                        for param in local_params:
+                            param.ds_status = ZeroParamStatus.AVAILABLE
+                            logger.debug(f"[Param {param.ds_id}] Status after local gather: {param.ds_status}")
+                    
+            # 리모트 파라미터 한번에 처리
+            if remote_params:
+                logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters via all-gather")
+                self.__all_gather_params(remote_params, forward)
             
             self.__profiler.stop_event(event_name, fetch_numel)
 
@@ -578,19 +576,15 @@ class PartitionedParameterCoordinator:
     @compiler.disable
     @instrument_w_nvtx
     def __release_param(self, param: Parameter) -> None:
-        #logger.info(f"[Release Check] Param {param.ds_id}: "
-        #           f"status={param.ds_status}, "
-        #           f"active_modules={len(param.ds_active_sub_modules)}, "
-        #           f"release_to_cpu={self.release_to_cpu}")
-        
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             try:
                 # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
                 has_local_copy = self._check_local_copies(param)
                 
-                if has_local_copy and param.ds_status != ZeroParamStatus.AVAILABLE:
-                    # AVAILABLE 상태가 아닐 때만 gather 시도
-                    self._gather_from_local_gpus(param)
+                if has_local_copy:
+                    # 다른 GPU에 있어도 partition은 해야 함
+                    logger.info(f"[Local Keep] Param {param.ds_id} exists in other local GPUs")
+                    param.partition()
                 elif param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
                     # NVME offload 사용하는 경우
                     param.partition()
@@ -599,13 +593,14 @@ class PartitionedParameterCoordinator:
                     logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                     self._manage_cpu_cache(param)
                     param.partition()
+                else:
+                    # 기본적으로는 partition 수행
+                    param.partition()
                 
             except Exception as e:
                 logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
-                # 에러 발생 시 기본 동작 - CPU로 이동
-                if self.release_to_cpu:
-                    self._manage_cpu_cache(param)
-                    param.partition()
+                # 에러 발생 시 기본 동작 - partition
+                param.partition()
 
     def _manage_cpu_cache(self, param):
         """CPU 캐시 관리 - 노드 내 GPU에 없는 파라미터만 캐시"""
@@ -747,20 +742,23 @@ class PartitionedParameterCoordinator:
     def _check_local_copies(self, param: Parameter) -> bool:
         """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
         try:
-            # CUDA 텐서로 통신
+            # 현재 GPU의 rank
+            local_rank = dist.get_rank() % self.gpus_per_node
+            
+            # GPU 상에서 직접 통신
             has_param = torch.tensor([param.ds_status == ZeroParamStatus.AVAILABLE], 
                                    device=get_accelerator().device_name())
             gathered = [torch.zeros_like(has_param) for _ in range(self.gpus_per_node)]
             
-            # 기존에 생성된 local_group 사용
+            # 노드 내 GPU 간 all_gather 수행
             dist.all_gather(gathered, has_param, group=self.local_group)
             
-            # 2개 이상의 GPU가 파라미터를 가지고 있는지 확인 
-            return sum(g.item() for g in gathered) > 1
+            # 현재 GPU를 제외한 다른 GPU들 중에서 파라미터를 가진 GPU가 있는지 확인
+            other_gpus_have_param = sum(g.item() for i, g in enumerate(gathered) if i != local_rank) > 0
+            return other_gpus_have_param
             
         except Exception as e:
             logger.warning(f"[Local Check] Failed to check local copies for param {param.ds_id}: {str(e)}")
-            # 에러 발생 시 안전하게 False 반환
             return False
 
     def _gather_from_local_gpus(self, param: Parameter) -> None:
@@ -776,7 +774,7 @@ class PartitionedParameterCoordinator:
             try:
                 # 파라미터가 분할된 상태인지 확인
                 if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                    # 분할된 상태에서만 all_gather 수행
+                    # GPU 간 직접 all_gather 수행
                     handle = param.all_gather_coalesced([param])
                     if handle:
                         handle.wait()
