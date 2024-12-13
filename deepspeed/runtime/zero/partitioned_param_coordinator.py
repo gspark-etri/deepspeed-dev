@@ -605,7 +605,18 @@ class PartitionedParameterCoordinator:
                 param.partition()
 
     def _manage_cpu_cache(self, param):
-        """CPU 캐시 관리 - 캐시 크기 제한 및 LRU 정책"""
+        """CPU 캐시 관리 - 담당 GPU만 캐시 수행"""
+        # 현재 GPU가 이 파라미터를 담당하는지 확인
+        responsible_gpu = self._get_responsible_gpu(param)
+        if responsible_gpu != dist.get_rank() % self.gpus_per_node:
+            logger.debug(f"[Cache Skip] Param {param.ds_id} assigned to different GPU")
+            return
+        
+        # 이미 캐시에 있는 경우 중복 추가 방지
+        if param.ds_id in self.cpu_param_cache:
+            logger.debug(f"[Cache Skip] Param {param.ds_id} already in cache")
+            return
+        
         param_size = param.ds_numel * param.element_size()
         
         # 캐시 공간 확보
@@ -620,14 +631,20 @@ class PartitionedParameterCoordinator:
 
         try:
             # CPU 캐시에 저장
-            cached_tensor = param.data.cpu().pin_memory() if self.pin_memory else param.data.cpu()
-            self.cpu_param_cache[param.ds_id] = cached_tensor
-            self.cpu_buffer_used += param_size
-            self.param_access_stats[param.ds_id] = 1
-            logger.info(f"[Cache Add] Param {param.ds_id} (size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
-            
+            with torch.no_grad():  # 메모리 사용량 감소
+                cached_tensor = param.data.cpu().pin_memory() if self.pin_memory else param.data.cpu()
+                self.cpu_param_cache[param.ds_id] = cached_tensor
+                self.cpu_buffer_used += param_size
+                self.param_access_stats[param.ds_id] = 1
+                logger.info(f"[Cache Add] Param {param.ds_id} (size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
+                
         except Exception as e:
             logger.warning(f"[Cache Error] Failed to cache param {param.ds_id}: {str(e)}")
+            # 실패한 경우 캐시 상태 정리
+            if param.ds_id in self.cpu_param_cache:
+                del self.cpu_param_cache[param.ds_id]
+            if param.ds_id in self.param_access_stats:
+                del self.param_access_stats[param.ds_id]
 
     @instrument_w_nvtx
     @functools.lru_cache(maxsize=None)
@@ -729,23 +746,42 @@ class PartitionedParameterCoordinator:
             world_rank = dist.get_rank()
             node_rank = world_rank // self.gpus_per_node
             
-            # 파라미터의 소유권 정보 확인 (메타데이터)
+            # 파라미터의 소유권 정보 확인
             param_owner = param.ds_id % dist.get_world_size()
             owner_node = param_owner // self.gpus_per_node
             
-            # 현재 노드에 있는지 확인
-            local_exists = (owner_node == node_rank)
-            
-            if local_exists:
+            # 현재 노드에 있는지만 확인
+            is_local = (owner_node == node_rank)
+            if is_local:
                 logger.debug(f"[Param {param.ds_id}] Found in local node (node {node_rank})")
             else:
                 logger.debug(f"[Param {param.ds_id}] Found in remote node {owner_node}")
             
-            return local_exists
+            return is_local
             
         except Exception as e:
             logger.warning(f"[Local Check] Failed for param {param.ds_id}: {str(e)}")
             return False
+
+    def _get_responsible_gpu(self, param: Parameter) -> int:
+        """파라미터를 담당할 GPU 결정"""
+        try:
+            world_rank = dist.get_rank()
+            local_rank = world_rank % self.gpus_per_node
+            
+            # 파라미터 ID를 기반으로 담당 GPU 결정
+            responsible_gpu = param.ds_id % self.gpus_per_node
+            
+            if responsible_gpu == local_rank:
+                logger.debug(f"[Param {param.ds_id}] Assigned to current GPU {local_rank}")
+            else:
+                logger.debug(f"[Param {param.ds_id}] Assigned to GPU {responsible_gpu}")
+            
+            return responsible_gpu
+            
+        except Exception as e:
+            logger.warning(f"[GPU Assignment] Failed for param {param.ds_id}: {str(e)}")
+            return -1
 
     def _gather_from_local_gpus(self, param: Parameter) -> None:
         """노드 내 GPU들과 파라미터 all-gather"""
