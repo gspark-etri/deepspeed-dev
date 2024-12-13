@@ -663,7 +663,7 @@ class PartitionedParameterCoordinator:
         return param.ds_status == ZeroParamStatus.AVAILABLE
 
     def _check_local_copies(self, param: Parameter) -> bool:
-        """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
+        """같은 노��의 다른 GPU가 파라미터를 가지고 있는지 확인"""
         try:
             world_rank = dist.get_rank()
             node_rank = world_rank // self.gpus_per_node
@@ -781,9 +781,17 @@ class PartitionedParameterCoordinator:
 
     def _track_backward_params(self, params):
         """Backward 단계에서 파라미터 상태 추적"""
+        # 이미 처리된 파라미터 추적
+        processed_params = set()
+        
         for param in params:
+            if param.ds_id in processed_params:
+                continue
+            
             if param.ds_status == ZeroParamStatus.AVAILABLE:
-                # 이미 사용 가능한 파라미터는 건너뛰기
+                # 이미 사용 가능한 파라미터는 상태만 확인
+                logger.debug(f"[Backward] Param {param.ds_id} already available")
+                processed_params.add(param.ds_id)
                 continue
             
             # 캐시 상태 확인
@@ -801,3 +809,5 @@ class PartitionedParameterCoordinator:
             if param in self.__inflight_param_registry:
                 logger.info(f"[Backward] Waiting for param {param.ds_id}")
                 self.__inflight_param_registry.pop(param).wait()
+            
+            processed_params.add(param.ds_id)
