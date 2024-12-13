@@ -309,44 +309,39 @@ class PartitionedParameterCoordinator:
 
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
-        """파라미터 fetch - stream 기반 최적화"""
+        """파라미터 fetch"""
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         unavailable_params = {p for p in params_to_fetch 
                              if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
         if not unavailable_params:
             return
-        
+
         # 1. 파라미터 분류
         param_groups = self._group_parameters(unavailable_params)
         
         # 2. 파이프라인 처리
         with torch.cuda.stream(self.__allgather_stream):
-            # 2.1 로컬 파라미터 처리
-            if param_groups['local']:
-                logger.info(f"[FETCH] Processing local params")
-                self._process_local_params(param_groups['local'])
-            
-            # 2.2 캐시된 파라미터 복원
-            cached_failed = []
-            if param_groups['cached']:
-                logger.info(f"[FETCH] Restoring cached params")
-                cached_failed = self._process_cached_params(param_groups['cached'])
-            
-            # 2.3 리모트 파라미터 처리
-            remote_params = param_groups['remote'] + cached_failed
+            # 2.1 리모트 파라미터 먼저 처리 (all_gather)
+            remote_params = param_groups['remote']
             if remote_params:
-                logger.info(f"[FETCH] Starting all_gather")
                 self.__all_gather_params(remote_params, forward)
-                logger.info(f"[FETCH] Waiting for all_gather")
                 self._wait_for_batch(remote_params)
             
+            # 2.2 로컬 파라미터 처리
+            if param_groups['local']:
+                self._process_local_params(param_groups['local'])
+            
+            # 2.3 캐시된 파라미터 복원
+            if param_groups['cached']:
+                failed = self._process_cached_params(param_groups['cached'])
+                if failed:
+                    # 실패한 캐시 파라미터는 all_gather로 처리
+                    self.__all_gather_params(failed, forward)
+                    self._wait_for_batch(failed)
+
             # 2.4 스트림 동기화
             if not get_accelerator().resolves_data_dependency():
-                logger.info(f"[FETCH] Synchronizing streams")
                 get_accelerator().current_stream().wait_stream(self.__allgather_stream)
-
-        # 3. 결과 검증
-        self._verify_params(params_to_fetch, current_submodule)
 
     def _group_parameters(self, params):
         """파라미터를 특성별로 그룹화"""
@@ -849,16 +844,14 @@ class PartitionedParameterCoordinator:
         self.__profiler.stop_event(wait_event_name, wait_numel)
 
     def _wait_for_batch(self, params):
-        """Wait for specific batch of parameters"""
+        """Wait for parameters"""
+        if not params:
+            return
+        
         for param in params:
             if param in self.__inflight_param_registry:
-                logger.info(f"[WAIT] Waiting for all_gather")
                 with get_accelerator().stream(self.__allgather_stream):
                     self.__inflight_param_registry.pop(param).wait()
-                
-        if not get_accelerator().resolves_data_dependency():
-            logger.info("[WAIT] Synchronizing streams")
-            get_accelerator().current_stream().wait_stream(self.__allgather_stream)
 
     def _track_backward_params(self, params):
         """Backward 단계에서 파라미터 상태 추적"""
