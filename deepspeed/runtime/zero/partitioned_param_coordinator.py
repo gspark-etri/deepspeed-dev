@@ -308,71 +308,133 @@ class PartitionedParameterCoordinator:
 
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
-        """파라미터 fetch 순서:
-        1. 현재 서브모듈에 필요한 파라미터 식별
-        2. 캐시된 파라미터 복원 (가장 빠름)
-        3. 로컬 GPU에서 파라미터 가져오기 (중간)
-        4. 리모트 GPU에서 파라미터 가져오기 (가장 느림)
+        """파라미터 fetch 최적화:
+        1. 통신 최소화를 위한 배치 처리
+        2. 스트림 파이프라이닝
+        3. 중복 작업 제거
         """
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
         
-        # 이미 사용 가능한 파라미터는 건너뛰기
-        unavailable_params = {p for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
+        # 이미 처리된 파라미터는 건너뛰기
+        unavailable_params = {p for p in params_to_fetch 
+                             if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
         if not unavailable_params:
             return
         
         fetch_numel = sum(p.partition_numel() for p in unavailable_params)
         self.__profiler.start_event(event_name)
         
-        # 1. 파라미터 분류
-        local_params = []  # 같은 노드의 GPU에 있는 파라미터
-        cached_params = []  # CPU 캐시에 있는 파라미터
-        remote_params = []  # 다른 노드의 GPU에 있는 파라미터
+        # 1. 파라미터 분류 및 배치화
+        param_groups = self._group_parameters(unavailable_params)
         
-        for param in unavailable_params:
+        # 2. 파이프라인 처리
+        with torch.cuda.stream(self.__allgather_stream):
+            # 2.1 로컬 파라미터 처리 (비동기)
+            if param_groups['local']:
+                self._process_local_params(param_groups['local'])
+                
+            # 2.2 캐시된 파라미터 복원 (비동기)
+            cache_event = None
+            if param_groups['cached']:
+                cache_event = self._process_cached_params(param_groups['cached'])
+                
+            # 2.3 리모트 파라미터 처리 (배치 통신)
+            if param_groups['remote']:
+                self._process_remote_params(param_groups['remote'], forward)
+                
+            # 2.4 동기화 포인트
+            if cache_event:
+                cache_event.wait()
+                
+        # 3. 결과 검증
+        self._verify_params(params_to_fetch, current_submodule)
+        self.__profiler.stop_event(event_name, fetch_numel)
+
+    def _group_parameters(self, params):
+        """파라미터를 특성별로 그룹화"""
+        groups = {
+            'local': [],   # 같은 노드의 GPU
+            'cached': [],  # CPU 캐시
+            'remote': []   # 다른 노드
+        }
+        
+        for param in params:
             if self._check_local_copies(param):
-                local_params.append(param)
+                groups['local'].append(param)
             elif self.release_to_cpu and param.ds_id in self.cpu_param_cache:
-                cached_params.append(param)
+                groups['cached'].append(param)
                 self.cache_hits += 1
             else:
-                remote_params.append(param)
+                groups['remote'].append(param)
                 self.cache_misses += 1
+                
+        return groups
+
+    def _process_local_params(self, params):
+        """로컬 파라미터 일괄 처리"""
+        if not params:
+            return
         
-        # 2. 캐시된 파라미터 복원 (가장 빠름)
-        if cached_params:
-            logger.info(f"[{event_name}] Restoring {len(cached_params)} cached parameters")
-            for param in cached_params:
+        logger.info(f"Processing {len(params)} local parameters")
+        # 한 번의 all_gather로 처리
+        handle = params[0].all_gather_coalesced(params)
+        if handle:
+            handle.wait()
+            for param in params:
+                param.ds_status = ZeroParamStatus.AVAILABLE
+
+    def _process_cached_params(self, params):
+        """캐시된 파라미터 비동기 복원"""
+        if not params:
+            return None
+        
+        logger.info(f"Restoring {len(params)} cached parameters")
+        cache_stream = torch.cuda.Stream()
+        
+        with torch.cuda.stream(cache_stream):
+            for param in params:
                 self._restore_from_cache(param)
-            
-        # 3. 로컬 GPU에서 파라미터 가져오기 (중간)
-        if local_params:
-            logger.info(f"[{event_name}] Gathering {len(local_params)} local parameters")
-            with get_accelerator().stream(self.__allgather_stream):
-                handle = local_params[0].all_gather_coalesced(local_params)
-                if handle:
-                    handle.wait()
-                    for param in local_params:
-                        param.ds_status = ZeroParamStatus.AVAILABLE
-                    
-        # 4. 리모트 GPU에서 파라미터 가져오기 (가장 느림)
-        if remote_params:
-            logger.info(f"[{event_name}] Gathering {len(remote_params)} remote parameters")
-            # 배치 단위로 처리하여 메모리 사용량 조절
-            batch_size = min(8, len(remote_params))
-            for i in range(0, len(remote_params), batch_size):
-                batch = remote_params[i:i+batch_size]
-                self.__all_gather_params(batch, forward)
-                # 각 배치 완료 대기
-                self._wait_for_batch(batch)
-            
-        # 모든 파라미터가 사용 가능한지 확인
-        for param in params_to_fetch:
-            param.ds_active_sub_modules.add(current_submodule.id)
-            assert param.ds_status == ZeroParamStatus.AVAILABLE, f"Parameter {param.ds_id} not available after fetch"
+                
+        event = torch.cuda.Event()
+        event.record(cache_stream)
+        return event
+
+    def _process_remote_params(self, params, forward):
+        """리모트 파라미터 배치 처리"""
+        if not params:
+            return
         
-        self.__profiler.stop_event(event_name, fetch_numel)
+        logger.info(f"Processing {len(params)} remote parameters")
+        # 통신 최적화를 위한 배치 크기
+        batch_size = min(16, len(params))
+        
+        # CPU 캐시 미리 할당
+        if self.release_to_cpu:
+            self._prepare_cpu_cache(params)
+        
+        # 배치 단위로 all-gather
+        for i in range(0, len(params), batch_size):
+            batch = params[i:i+batch_size]
+            self.__all_gather_params(batch, forward)
+            self._wait_for_batch(batch)
+
+    def _prepare_cpu_cache(self, params):
+        """CPU 캐시 사전 할당"""
+        cache_stream = torch.cuda.Stream()
+        with torch.cuda.stream(cache_stream):
+            for param in params:
+                if param.ds_id not in self.cpu_param_cache:
+                    cpu_tensor = torch.empty_like(param.data, device='cpu')
+                    self.cpu_param_cache[param.ds_id] = cpu_tensor
+                    self.cpu_buffer_used += cpu_tensor.numel() * cpu_tensor.element_size()
+
+    def _verify_params(self, params, module):
+        """파라미터 상태 검증"""
+        for param in params:
+            param.ds_active_sub_modules.add(module.id)
+            assert param.ds_status == ZeroParamStatus.AVAILABLE, \
+                f"Parameter {param.ds_id} not available after fetch"
 
     @instrument_w_nvtx
     @torch.no_grad()
@@ -599,6 +661,11 @@ class PartitionedParameterCoordinator:
             cached_tensor = self.cpu_param_cache[param.ds_id]
             logger.info(f"[Cache Restore] Found cached tensor for param {param.ds_id}")
             
+            # GPU 메모리로 이동 전에 다른 노드와 동기화
+            if not self._check_local_copies(param):
+                logger.info(f"[Cache Restore] Param {param.ds_id} is remote, syncing with other nodes")
+                dist.broadcast(cached_tensor, src=param.ds_id % dist.get_world_size())
+            
             with torch.cuda.stream(self.__allgather_stream):
                 param.data = cached_tensor.cuda(non_blocking=True)
                 logger.info(f"[Cache Restore] Moved param {param.ds_id} to GPU")
@@ -613,8 +680,7 @@ class PartitionedParameterCoordinator:
             logger.info(f"[Cache Restore] Completed for param {param.ds_id}")
             
         except Exception as e:
-            logger.error(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}\n"
-                        f"Stack trace: {traceback.format_exc()}")
+            logger.error(f"[Cache Restore] Failed for param {param.ds_id}: {str(e)}")
             raise
 
     def post_backward_hook(self, param):
