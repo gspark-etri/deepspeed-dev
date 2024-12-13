@@ -380,7 +380,14 @@ class PartitionedParameterCoordinator:
             # 3. 리모트 파라미터 처리 (가장 느림)
             if remote_params:
                 logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters")
-                self.__all_gather_params(remote_params, forward)
+                # 배치 크기 제한
+                batch_size = min(8, len(remote_params))
+                for i in range(0, len(remote_params), batch_size):
+                    batch = remote_params[i:i+batch_size]
+                    self.__all_gather_params(batch, forward)
+                    # 각 배치마다 완료 대기
+                    if self.__inflight_param_registry:
+                        self._wait_for_batch(batch)
                 
             # 처리 완료 대기
             if self.__inflight_param_registry:
@@ -740,3 +747,14 @@ class PartitionedParameterCoordinator:
         if not get_accelerator().resolves_data_dependency():
             get_accelerator().current_stream().wait_stream(self.__allgather_stream)
         self.__profiler.stop_event(wait_event_name, wait_numel)
+
+    def _wait_for_batch(self, params):
+        """Wait for specific batch of parameters"""
+        for param in params:
+            if param in self.__inflight_param_registry:
+                with get_accelerator().stream(self.__allgather_stream):
+                    self.__inflight_param_registry.pop(param).wait()
+                
+        # 스트림 동기화
+        if not get_accelerator().resolves_data_dependency():
+            get_accelerator().current_stream().wait_stream(self.__allgather_stream)
