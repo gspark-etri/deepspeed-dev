@@ -22,6 +22,7 @@ from deepspeed.runtime.compiler import is_compiling
 
 import logging
 import traceback
+import time
 
 ENABLE_PROFILER = False
 
@@ -310,52 +311,58 @@ class PartitionedParameterCoordinator:
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
         """파라미터 fetch 최적화"""
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
-        event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
-        
-        # 이미 처리된 파라미터는 건너뛰기
         unavailable_params = {p for p in params_to_fetch 
                              if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
         if not unavailable_params:
             return
         
-        fetch_numel = sum(p.partition_numel() for p in unavailable_params)
-        self.__profiler.start_event(event_name)
-        
-        # 1. 파라미터 분류 및 배치화
+        # 1. 파라미터 분류
         param_groups = self._group_parameters(unavailable_params)
         
-        # 2. 파이프라인 처리
+        # 2. 비동기 처리 시작
         with torch.cuda.stream(self.__allgather_stream):
-            # 2.1 로컬 파라미터 처리
+            pending_handles = []
+            
+            # 2.1 로컬 파라미터 처리 (비동기)
             if param_groups['local']:
-                self._process_local_params(param_groups['local'])
-                
-            # 2.2 캐시된 파라미터 복원
+                handle = self._process_local_params(param_groups['local'])
+                if handle:
+                    pending_handles.append(handle)
+            
+            # 2.2 캐시된 파라미터 복원 (비동기)
             cached_failed = []
             if param_groups['cached']:
                 cached_failed = self._process_cached_params(param_groups['cached'])
-                
-            # 2.3 모든 리모트/실패한 파라미터를 한 번에 처리
+            
+            # 2.3 리모트 파라미터 처리 (비동기)
             remote_params = param_groups['remote'] + cached_failed
             if remote_params:
-                # 크기별로 정렬하여 배치 처리
-                remote_params.sort(key=lambda p: p.partition_numel(), reverse=True)
-                batch_size = min(4, len(remote_params))  # 큰 파라미터는 더 작은 배치로
-                
-                for i in range(0, len(remote_params), batch_size):
-                    batch = remote_params[i:i+batch_size]
-                    logger.info(f"Gathering batch of {len(batch)} parameters")
-                    self.__all_gather_params(batch, forward)
-                    # 각 배치가 완료될 때까지 대기
-                    self._wait_for_batch(batch)
-                    
-                    # 스트림 동기화
-                    if not get_accelerator().resolves_data_dependency():
-                        get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+                # 모든 프로세스가 동시에 all_gather 시작
+                handle = self.__all_gather_params(remote_params, forward)
+                if handle:
+                    pending_handles.append(handle)
             
-        # 3. 결과 검증
-        self._verify_params(params_to_fetch, current_submodule)
-        self.__profiler.stop_event(event_name, fetch_numel)
+            # 3. 모든 비동기 작업 완료 대기 (타임아웃 적용)
+            timeout_sec = 30.0  # 적절한 타임아웃 설정
+            start_time = time.time()
+            
+            for handle in pending_handles:
+                while not handle.is_completed():
+                    # 주기적으로 타임아웃 체크
+                    if time.time() - start_time > timeout_sec:
+                        raise RuntimeError(f"Parameter fetch timeout after {timeout_sec} seconds")
+                    # CPU 부하 감소를 위한 짧은 대기
+                    time.sleep(0.001)
+            
+            # 4. 결과 검증
+            failed_params = []
+            for param in unavailable_params:
+                if param.ds_status != ZeroParamStatus.AVAILABLE:
+                    failed_params.append(param)
+                    logger.error(f"Parameter {param.ds_id} not available after fetch")
+            
+            if failed_params:
+                raise RuntimeError(f"Failed to fetch {len(failed_params)} parameters")
 
     def _group_parameters(self, params):
         """파라미터를 특성별로 그룹화"""
@@ -378,17 +385,12 @@ class PartitionedParameterCoordinator:
         return groups
 
     def _process_local_params(self, params):
-        """로컬 파라미터 일괄 처리"""
+        """로컬 파라미터 비동기 처리"""
         if not params:
-            return
+            return None
         
         logger.info(f"Processing {len(params)} local parameters")
-        # 한 번의 all_gather로 처리
-        handle = params[0].all_gather_coalesced(params)
-        if handle:
-            handle.wait()
-            for param in params:
-                param.ds_status = ZeroParamStatus.AVAILABLE
+        return params[0].all_gather_coalesced(params)  # 비동기 핸들 반환
 
     def _process_cached_params(self, params):
         """CPU 캐시에서 필요한 GPU로 파라미터 복원"""
