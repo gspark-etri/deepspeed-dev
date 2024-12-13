@@ -396,6 +396,10 @@ class PartitionedParameterCoordinator:
                 
             self.__profiler.stop_event(event_name, fetch_numel)
 
+        if not forward:
+            # backward 단계에서 파라미터 상태 추적
+            self._track_backward_params(params_to_fetch)
+            
         if not forward:  # backward 단계일 때 추가 로깅
             logger.info(f"[Backward] Starting fetch for module {current_submodule.__class__.__name__}")
             for param in params_to_fetch:
@@ -774,3 +778,26 @@ class PartitionedParameterCoordinator:
         # 스트림 동기화
         if not get_accelerator().resolves_data_dependency():
             get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+
+    def _track_backward_params(self, params):
+        """Backward 단계에서 파라미터 상태 추적"""
+        for param in params:
+            if param.ds_status == ZeroParamStatus.AVAILABLE:
+                # 이미 사용 가능한 파라미터는 건너뛰기
+                continue
+            
+            # 캐시 상태 확인
+            in_cache = param.ds_id in self.cpu_param_cache
+            if in_cache:
+                # 캐시에서 복원
+                logger.info(f"[Backward] Restoring param {param.ds_id} from cache")
+                self._restore_from_cache(param)
+            else:
+                # 캐시에 없으면 all-gather 수행
+                logger.info(f"[Backward] All-gathering param {param.ds_id}")
+                self.__all_gather_params([param], forward=False)
+            
+            # 상태 변경 대기
+            if param in self.__inflight_param_registry:
+                logger.info(f"[Backward] Waiting for param {param.ds_id}")
+                self.__inflight_param_registry.pop(param).wait()
