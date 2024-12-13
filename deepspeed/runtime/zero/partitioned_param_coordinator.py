@@ -384,7 +384,7 @@ class PartitionedParameterCoordinator:
                 
             # 처리 완료 대기
             if self.__inflight_param_registry:
-                self._PartitionedParameterCoordinator__wait_for_params()
+                self._wait_for_params(params_to_fetch, current_submodule, forward)
                 
             self.__profiler.stop_event(event_name, fetch_numel)
 
@@ -710,7 +710,7 @@ class PartitionedParameterCoordinator:
                     logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                     self._manage_cpu_cache(param)
 
-    def _wait_for_params(self):
+    def _wait_for_params(self, params_to_fetch, current_submodule, forward):
         """Wait for all in-flight parameter requests to complete."""
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
@@ -731,10 +731,10 @@ class PartitionedParameterCoordinator:
 
                     self.__inflight_param_registry.pop(param).wait()
 
-                    if not get_accelerator().handles_memory_backpressure():
-                        event = get_accelerator().Event()
-                        event.record()
-                        self.__ongoing_fetch_events.append(event)
+                if not get_accelerator().handles_memory_backpressure():
+                    event = get_accelerator().Event()
+                    event.record()
+                    self.__ongoing_fetch_events.append(event)
 
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
         if not get_accelerator().resolves_data_dependency():
