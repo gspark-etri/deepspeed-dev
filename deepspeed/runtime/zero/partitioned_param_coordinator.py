@@ -306,105 +306,73 @@ class PartitionedParameterCoordinator:
     Fetching, prefetching, and releasing parameters
     """
 
-    @compiler.disable
-    @instrument_w_nvtx
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
-        """This method does the following (in order):
-        1. kick off fetch for parameters in immediately required sub module
-        2. kick off fetch for next few parameters we will need later (prefetch)
-        3. block on parameters in immediately required sub module
+        """파라미터 fetch 순서:
+        1. 현재 서브모듈에 필요한 파라미터 식별
+        2. 캐시된 파라미터 복원 (가장 빠름)
+        3. 로컬 GPU에서 파라미터 가져오기 (중간)
+        4. 리모트 GPU에서 파라미터 가져오기 (가장 느림)
         """
-        #phase = "Forward" if forward else "Backward"
-        #logger.info(f"=== Starting {phase} for module: {current_submodule.__class__.__name__} ===")
-        
-        if logger.isEnabledFor(logging.DEBUG):
-            debug_rank0(
-                f"{self.__step_id}: M{current_submodule.id}({type(current_submodule).__name__}) P{[p.ds_id for p in iter_params(current_submodule, recurse=z3_leaf_module(current_submodule))]} "
-                + str({
-                    "avail": f"{self.__n_available_params:.1e}",
-                    "queue_sz": f"{len(self.__param_queue or [])}",
-                    "inflight": [p.ds_id for p in self.__inflight_param_registry],
-                }))
-
-        params_to_fetch = frozenset(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
-        
+        params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
-        fetch_numel = sum([p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
         
-        if fetch_numel > 0:
-            self._dump_param_ids(event_name, current_submodule.id,
-                               [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
-            self.__profiler.start_event(event_name)
+        # 이미 사용 가능한 파라미터는 건너뛰기
+        unavailable_params = {p for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE}
+        if not unavailable_params:
+            return
+        
+        fetch_numel = sum(p.partition_numel() for p in unavailable_params)
+        self.__profiler.start_event(event_name)
+        
+        # 1. 파라미터 분류
+        local_params = []  # 같은 노드의 GPU에 있는 파라미터
+        cached_params = []  # CPU 캐시에 있는 파라미터
+        remote_params = []  # 다른 노드의 GPU에 있는 파라미터
+        
+        for param in unavailable_params:
+            if self._check_local_copies(param):
+                local_params.append(param)
+            elif self.release_to_cpu and param.ds_id in self.cpu_param_cache:
+                cached_params.append(param)
+                self.cache_hits += 1
+            else:
+                remote_params.append(param)
+                self.cache_misses += 1
+        
+        # 2. 캐시된 파라미터 복원 (가장 빠름)
+        if cached_params:
+            logger.info(f"[{event_name}] Restoring {len(cached_params)} cached parameters")
+            for param in cached_params:
+                self._restore_from_cache(param)
             
-            local_params = []
-            cached_params = []
-            remote_params = []
+        # 3. 로컬 GPU에서 파라미터 가져오기 (중간)
+        if local_params:
+            logger.info(f"[{event_name}] Gathering {len(local_params)} local parameters")
+            with get_accelerator().stream(self.__allgather_stream):
+                handle = local_params[0].all_gather_coalesced(local_params)
+                if handle:
+                    handle.wait()
+                    for param in local_params:
+                        param.ds_status = ZeroParamStatus.AVAILABLE
+                    
+        # 4. 리모트 GPU에서 파라미터 가져오기 (가장 느림)
+        if remote_params:
+            logger.info(f"[{event_name}] Gathering {len(remote_params)} remote parameters")
+            # 배치 단위로 처리하여 메모리 사용량 조절
+            batch_size = min(8, len(remote_params))
+            for i in range(0, len(remote_params), batch_size):
+                batch = remote_params[i:i+batch_size]
+                self.__all_gather_params(batch, forward)
+                # 각 배치 완료 대기
+                self._wait_for_batch(batch)
             
-            # 먼저 모든 파라미터를 분류
-            for param in params_to_fetch:
-                if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                    # 1. 로컬/리모트 GPU 체크
-                    local_exists = self._check_local_copies(param)
-                    
-                    if local_exists:
-                        local_params.append(param)
-                        continue
-                        
-                    # 2. CPU 캐시 체크
-                    if self.release_to_cpu and param.ds_id in self.cpu_param_cache:
-                        cached_params.append(param)
-                        self.cache_hits += 1
-                        continue
-                        
-                    # 3. 리모트 GPU 체크
-                    remote_params.append(param)
-                    self.cache_misses += 1
-
-            # 1. 로컬 파라미터 처리 (가장 빠름)
-            if local_params:
-                logger.info(f"[{event_name}] Processing {len(local_params)} local parameters")
-                with get_accelerator().stream(self.__allgather_stream):
-                    handle = local_params[0].all_gather_coalesced(local_params)
-                    if handle:
-                        handle.wait()
-                        for param in local_params:
-                            param.ds_status = ZeroParamStatus.AVAILABLE
-                            logger.debug(f"[Param {param.ds_id}] Status after local gather: {param.ds_status}")
-                    
-            # 2. CPU 캐시에서 복원 (중간)
-            if cached_params:
-                logger.info(f"[{event_name}] Restoring {len(cached_params)} cached parameters")
-                for param in cached_params:
-                    self._restore_from_cache(param)
-                    
-            # 3. 리모트 파라미터 처리 (가장 느림)
-            if remote_params:
-                logger.info(f"[{event_name}] Processing {len(remote_params)} remote parameters")
-                # 배치 크기 제한
-                batch_size = min(8, len(remote_params))
-                for i in range(0, len(remote_params), batch_size):
-                    batch = remote_params[i:i+batch_size]
-                    self.__all_gather_params(batch, forward)
-                    # 각 배치마다 완료 대기
-                    if self.__inflight_param_registry:
-                        self._wait_for_batch(batch)
-                
-            # 처리 완료 대기
-            if self.__inflight_param_registry:
-                self._wait_for_params(params_to_fetch, current_submodule, forward)
-                
-            self.__profiler.stop_event(event_name, fetch_numel)
-
-        if not forward:
-            # backward 단계에서는 파라미터 상태를 먼저 확인
-            self._check_backward_params(params_to_fetch)
-            
-        if not forward:  # backward 단계일 때 추가 로깅
-            logger.info(f"[Backward] Starting fetch for module {current_submodule.__class__.__name__}")
-            for param in params_to_fetch:
-                logger.info(f"[Backward] Param {param.ds_id}: status={param.ds_status}, "
-                           f"in_cache={param.ds_id in self.cpu_param_cache}")
+        # 모든 파라미터가 사용 가능한지 확인
+        for param in params_to_fetch:
+            param.ds_active_sub_modules.add(current_submodule.id)
+            assert param.ds_status == ZeroParamStatus.AVAILABLE, f"Parameter {param.ds_id} not available after fetch"
+        
+        self.__profiler.stop_event(event_name, fetch_numel)
 
     @instrument_w_nvtx
     @torch.no_grad()
