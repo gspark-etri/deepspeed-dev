@@ -397,8 +397,8 @@ class PartitionedParameterCoordinator:
             self.__profiler.stop_event(event_name, fetch_numel)
 
         if not forward:
-            # backward 단계에서 파라미터 상태 추적
-            self._track_backward_params(params_to_fetch)
+            # backward 단계에서는 파라미터 상태를 먼저 확인
+            self._check_backward_params(params_to_fetch)
             
         if not forward:  # backward 단계일 때 추가 로깅
             logger.info(f"[Backward] Starting fetch for module {current_submodule.__class__.__name__}")
@@ -663,7 +663,7 @@ class PartitionedParameterCoordinator:
         return param.ds_status == ZeroParamStatus.AVAILABLE
 
     def _check_local_copies(self, param: Parameter) -> bool:
-        """같은 노��의 다른 GPU가 파라미터를 가지고 있는지 확인"""
+        """같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인"""
         try:
             world_rank = dist.get_rank()
             node_rank = world_rank // self.gpus_per_node
@@ -781,27 +781,27 @@ class PartitionedParameterCoordinator:
 
     def _track_backward_params(self, params):
         """Backward 단계에서 파라미터 상태 추적"""
-        # 이미 처리된 파라미터 추적
         processed_params = set()
         
         for param in params:
             if param.ds_id in processed_params:
+                logger.debug(f"[Backward Skip] Param {param.ds_id} already processed")
                 continue
             
             if param.ds_status == ZeroParamStatus.AVAILABLE:
-                # 이미 사용 가능한 파라미터는 상태만 확인
-                logger.debug(f"[Backward] Param {param.ds_id} already available")
+                if param.ds_id in self.cpu_param_cache:
+                    # 상태 불일치 해결
+                    logger.warning(f"[State Fix] Removing param {param.ds_id} from cache")
+                    del self.cpu_param_cache[param.ds_id]
                 processed_params.add(param.ds_id)
                 continue
             
             # 캐시 상태 확인
             in_cache = param.ds_id in self.cpu_param_cache
             if in_cache:
-                # 캐시에서 복원
                 logger.info(f"[Backward] Restoring param {param.ds_id} from cache")
                 self._restore_from_cache(param)
             else:
-                # 캐시에 없으면 all-gather 수행
                 logger.info(f"[Backward] All-gathering param {param.ds_id}")
                 self.__all_gather_params([param], forward=False)
             
@@ -811,3 +811,24 @@ class PartitionedParameterCoordinator:
                 self.__inflight_param_registry.pop(param).wait()
             
             processed_params.add(param.ds_id)
+
+    def _check_backward_params(self, params):
+        """Backward 단계에서 파라미터 상태 사전 확인"""
+        param_states = {}
+        for param in params:
+            state = {
+                'id': param.ds_id,
+                'status': param.ds_status,
+                'in_cache': param.ds_id in self.cpu_param_cache,
+                'in_flight': param in self.__inflight_param_registry
+            }
+            param_states[param.ds_id] = state
+            logger.info(f"[Backward Check] Param {param.ds_id}: {state}")
+        
+        # 상태 불일치 감지
+        for param_id, state in param_states.items():
+            if state['status'] == ZeroParamStatus.AVAILABLE:
+                if state['in_cache']:
+                    logger.warning(f"[State Mismatch] Param {param_id} is AVAILABLE but also in cache")
+                if state['in_flight']:
+                    logger.warning(f"[State Mismatch] Param {param_id} is AVAILABLE but also in flight")
