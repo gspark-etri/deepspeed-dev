@@ -6,7 +6,7 @@
 from dataclasses import dataclass
 import collections
 from collections import UserDict
-from typing import Deque, Set
+from typing import Deque, Set, Tuple
 
 from deepspeed import comm as dist
 from deepspeed.utils import z3_leaf_module
@@ -747,10 +747,10 @@ class PartitionedParameterCoordinator:
             return True
         return param.ds_status == ZeroParamStatus.AVAILABLE
 
-    def _check_local_copies(self, param: Parameter) -> tuple[bool, bool]:
+    def _check_local_copies(self, param: Parameter) -> Tuple[bool, bool]:
         """파라미터가 로컬/리모트 GPU에 있는지 확인
         Returns:
-            tuple: (local_exists, remote_exists)
+            Tuple[bool, bool]: (local_exists, remote_exists)
         """
         try:
             world_size = dist.get_world_size()
