@@ -585,62 +585,48 @@ class PartitionedParameterCoordinator:
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             try:
                 # 같은 노드의 다른 GPU가 파라미터를 가지고 있는지 확인
-                has_local_copy = self._check_local_copies(param)  # bool 값 반환
+                has_local_copy = self._check_local_copies(param)
                 
                 if has_local_copy:
+                    # 로컬에 있으면 partition만 수행
                     logger.info(f"[Local Keep] Param {param.ds_id} exists in other local GPUs")
+                    param.partition()
                 elif self.release_to_cpu:
-                    # CPU로 이동
+                    # 로컬에 없고 CPU 캐시 사용 가능하면 CPU로 이동
                     logger.info(f"[Cache Store] Moving param {param.ds_id} to CPU cache")
                     self._manage_cpu_cache(param)
-
-                param.partition()
-                
+                    param.partition()
+                else:
+                    # 그 외의 경우는 partition만 수행
+                    param.partition()
+                    
             except Exception as e:
                 logger.warning(f"[Release] Error releasing param {param.ds_id}: {str(e)}")
                 param.partition()
 
     def _manage_cpu_cache(self, param):
-        """CPU 캐시 관리 - 노드 내 GPU에 없는 파라미터만 캐시"""
-        # 노드 내 GPU에 파라미터가 있는지 확인
-        has_local_copy = self._check_local_copies(param)
-        
-        if has_local_copy:
-            logger.info(f"[Cache Skip] Param {param.ds_id} exists in local GPUs, skipping CPU cache")
-            return
-        
+        """CPU 캐시 관리 - 캐시 크기 제한 및 LRU 정책"""
         param_size = param.ds_numel * param.element_size()
         
         # 캐시 공간 확보
         while self.cpu_buffer_used + param_size > self.cpu_buffer_size and self.cpu_param_cache:
-            lru_params = sorted(self.param_access_stats.items(), 
-                              key=lambda x: (x[1], -list(self.cpu_param_cache.keys()).index(x[0])))
-            param_to_evict = lru_params[0][0]
-            
-            if param_to_evict in self.cpu_param_cache:
-                evicted_tensor = self.cpu_param_cache.pop(param_to_evict)
-                removed_size = evicted_tensor.numel() * evicted_tensor.element_size()
-                logger.info(f"[Cache Evict] Param {param_to_evict} "
-                           f"(access count: {self.param_access_stats[param_to_evict]}, "
-                           f"size: {removed_size/1e6:.2f}MB)")
-                self.cpu_buffer_used -= removed_size
-                del self.param_access_stats[param_to_evict]
+            # 가장 오래 사용되지 않은 파라미터 제거
+            lru_param_id = min(self.param_access_stats.items(), key=lambda x: x[1])[0]
+            if lru_param_id in self.cpu_param_cache:
+                evicted_tensor = self.cpu_param_cache.pop(lru_param_id)
+                self.cpu_buffer_used -= evicted_tensor.numel() * evicted_tensor.element_size()
+                del self.param_access_stats[lru_param_id]
+                logger.debug(f"[Cache Evict] Param {lru_param_id}")
 
         try:
-            # 노드 내 GPU에 없는 파라미터만 캐시에 저장
-            if self.pin_memory:
-                cached_tensor = param.data.cpu().pin_memory().clone()
-            else:
-                cached_tensor = param.data.cpu().clone()
-                
+            # CPU 캐시에 저장
+            cached_tensor = param.data.cpu().pin_memory() if self.pin_memory else param.data.cpu()
             self.cpu_param_cache[param.ds_id] = cached_tensor
             self.cpu_buffer_used += param_size
             self.param_access_stats[param.ds_id] = 1
+            logger.info(f"[Cache Add] Param {param.ds_id} (size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
             
-            logger.info(f"[Cache Add] Param {param.ds_id} "
-                       f"(size: {param_size/1e6:.2f}MB, total: {self.cpu_buffer_used/1e6:.2f}MB)")
-                        
-        except RuntimeError as e:
+        except Exception as e:
             logger.warning(f"[Cache Error] Failed to cache param {param.ds_id}: {str(e)}")
 
     @instrument_w_nvtx
