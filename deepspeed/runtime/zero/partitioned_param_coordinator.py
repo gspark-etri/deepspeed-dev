@@ -321,13 +321,11 @@ class PartitionedParameterCoordinator:
         
         # 2. 비동기 처리 시작
         with torch.cuda.stream(self.__allgather_stream):
-            pending_handles = []
-            
             # 2.1 로컬 파라미터 처리 (비동기)
             if param_groups['local']:
                 handle = self._process_local_params(param_groups['local'])
                 if handle:
-                    pending_handles.append(handle)
+                    handle.wait()  # wait() 사용
             
             # 2.2 캐시된 파라미터 복원 (비동기)
             cached_failed = []
@@ -338,23 +336,21 @@ class PartitionedParameterCoordinator:
             remote_params = param_groups['remote'] + cached_failed
             if remote_params:
                 # 모든 프로세스가 동시에 all_gather 시작
-                handle = self.__all_gather_params(remote_params, forward)
-                if handle:
-                    pending_handles.append(handle)
+                dist.barrier()  # 동기화 지점
+                
+                # 배치 크기로 나누어 처리
+                batch_size = 4
+                for i in range(0, len(remote_params), batch_size):
+                    batch = remote_params[i:i+batch_size]
+                    handle = self.__all_gather_params(batch, forward)
+                    if handle:
+                        handle.wait()  # 각 배치 완료 대기
+                        
+                    # 스트림 동기화
+                    if not get_accelerator().resolves_data_dependency():
+                        get_accelerator().current_stream().wait_stream(self.__allgather_stream)
             
-            # 3. 모든 비동기 작업 완료 대기 (타임아웃 적용)
-            timeout_sec = 30.0  # 적절한 타임아웃 설정
-            start_time = time.time()
-            
-            for handle in pending_handles:
-                while not handle.is_completed():
-                    # 주기적으로 타임아웃 체크
-                    if time.time() - start_time > timeout_sec:
-                        raise RuntimeError(f"Parameter fetch timeout after {timeout_sec} seconds")
-                    # CPU 부하 감소를 위한 짧은 대기
-                    time.sleep(0.001)
-            
-            # 4. 결과 검증
+            # 3. 결과 검증
             failed_params = []
             for param in unavailable_params:
                 if param.ds_status != ZeroParamStatus.AVAILABLE:
