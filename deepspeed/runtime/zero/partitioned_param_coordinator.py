@@ -319,27 +319,30 @@ class PartitionedParameterCoordinator:
         # 1. 파라미터 분류
         param_groups = self._group_parameters(unavailable_params)
         
-        # 2. 파이프라인 처리 - 모든 작업을 비동기로 시작
+        # 2. 파이프라인 처리
         with torch.cuda.stream(self.__allgather_stream):
             # 2.1 로컬 파라미터 처리
             if param_groups['local']:
+                logger.info(f"[FETCH] Processing local params")
                 self._process_local_params(param_groups['local'])
             
             # 2.2 캐시된 파라미터 복원
             cached_failed = []
             if param_groups['cached']:
+                logger.info(f"[FETCH] Restoring cached params")
                 cached_failed = self._process_cached_params(param_groups['cached'])
             
             # 2.3 리모트 파라미터 처리
             remote_params = param_groups['remote'] + cached_failed
             if remote_params:
+                logger.info(f"[FETCH] Starting all_gather")
                 self.__all_gather_params(remote_params, forward)
+                logger.info(f"[FETCH] Waiting for all_gather")
+                self._wait_for_batch(remote_params)
             
-            # 2.4 모든 파라미터가 준비될 때까지 대기
-            self._wait_for_batch(remote_params)
-            
-            # 2.5 스트림 동기화 (필요한 경우만)
+            # 2.4 스트림 동기화
             if not get_accelerator().resolves_data_dependency():
+                logger.info(f"[FETCH] Synchronizing streams")
                 get_accelerator().current_stream().wait_stream(self.__allgather_stream)
 
         # 3. 결과 검증
@@ -849,11 +852,12 @@ class PartitionedParameterCoordinator:
         """Wait for specific batch of parameters"""
         for param in params:
             if param in self.__inflight_param_registry:
+                logger.info(f"[WAIT] Waiting for all_gather")
                 with get_accelerator().stream(self.__allgather_stream):
                     self.__inflight_param_registry.pop(param).wait()
                 
-        # 스트림 동기화
         if not get_accelerator().resolves_data_dependency():
+            logger.info("[WAIT] Synchronizing streams")
             get_accelerator().current_stream().wait_stream(self.__allgather_stream)
 
     def _track_backward_params(self, params):
