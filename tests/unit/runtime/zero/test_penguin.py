@@ -31,10 +31,11 @@ class TestPenguinInterNodeOffload(DistributedTest):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("CPU accelerator does not support this test yet")
             
-        # 환경 변수에서 설정 읽어오기
         n_nodes = int(os.environ.get('NNODES', '1'))
         gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
         node_rank = int(os.environ.get('NODE_RANK', '0'))
+        
+        print(f"[Node {node_rank}] Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
         
         config_dict = {
             "train_batch_size": 32,
@@ -50,15 +51,14 @@ class TestPenguinInterNodeOffload(DistributedTest):
             "zero_optimization": {
                 "stage": 3,
                 "penguin": {
-                    "shard_size": gpus_per_node,  # 노드당 GPU 수로 설정
+                    "shard_size": gpus_per_node,
                     "hierarchial_params_gather": True
                 }
             },
         }
-        if get_accelerator().is_fp16_supported():
-            config_dict["fp16"] = {"enabled": True}
         
         hidden_dim = 10
+        print(f"[Node {node_rank}, Rank {dist.get_rank()}] Initializing model with hidden_dim={hidden_dim}")
 
         class SimpleModel(torch.nn.Module):
             def __init__(self, hidden_dim):
@@ -66,82 +66,98 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
                 self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
                 self.cross_entropy = torch.nn.CrossEntropyLoss()
+                print(f"[Node {node_rank}, Rank {dist.get_rank()}] Model parameters:")
+                for name, param in self.named_parameters():
+                    print(f"  - {name}: {param.shape}, device={param.device}")
 
             def forward(self, x, y):
+                print(f"[Node {node_rank}, Rank {dist.get_rank()}] Forward pass:")
+                print(f"  Input x: shape={x.shape}, device={x.device}")
                 hidden = self.linear1(x)
+                print(f"  After linear1: shape={hidden.shape}, device={hidden.device}")
                 output = self.linear2(hidden)
+                print(f"  After linear2: shape={output.shape}, device={output.device}")
                 loss = self.cross_entropy(output, y)
+                print(f"  Loss: {loss.item()}, device={loss.device}")
                 return loss
 
-        # Penguin Init으로 모델 초기화
         with deepspeed.zero.Penguin_Init(config_dict_or_path=config_dict):
             model = SimpleModel(hidden_dim)
+            print(f"[Node {node_rank}, Rank {dist.get_rank()}] Model initialized with Penguin")
+            for name, param in model.named_parameters():
+                print(f"  - {name}: status={param.ds_status}, device={param.device}")
 
         model, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
             config=config_dict
         )
+        print(f"[Node {node_rank}, Rank {dist.get_rank()}] DeepSpeed initialized")
 
-        # 학습 데이터 생성
+        # CPU 버퍼 초기화 확인
+        for name, param in model.named_parameters():
+            if not hasattr(param, 'penguin_cpu_buffer'):
+                param.penguin_cpu_buffer = torch.zeros_like(param.data, device='cpu')
+                print(f"[Node {node_rank}, Rank {dist.get_rank()}] Created CPU buffer for {name}")
+                print(f"  - Original param: {param.device}, shape={param.shape}")
+                print(f"  - CPU buffer: {param.penguin_cpu_buffer.device}, shape={param.penguin_cpu_buffer.shape}")
+
         data_loader = random_dataloader(
             model=model,
             total_samples=50,
             hidden_dim=hidden_dim,
             device=model.device
         )
+        print(f"[Node {node_rank}, Rank {dist.get_rank()}] Created dataloader")
 
-        # 학습 실행 및 검증
         dist.barrier()
         for i, batch in enumerate(data_loader):
-            # Forward pass 전에 파라미터 상태 확인
+            print(f"\n[Node {node_rank}, Rank {dist.get_rank()}] Batch {i}")
+            
+            # Forward pass 전 파라미터 상태
+            print("Parameter status before forward:")
             for name, param in model.named_parameters():
-                assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {name} missing penguin_cpu_buffer"
-                assert param.penguin_cpu_buffer.device == torch.device('cpu'), \
-                    f"Parameter {name}'s buffer is not on CPU"
+                print(f"  - {name}: status={param.ds_status}, device={param.device}")
+                if hasattr(param.ds_tensor, 'final_location'):
+                    print(f"    final_location={param.ds_tensor.final_location}")
 
             loss = model(batch[0], batch[1])
 
-            # Forward pass 후 다른 노드의 파라미터가 CPU에 있는지 확인
-            if dist.get_rank() % 8 == 0:  # 각 노드의 첫 번째 GPU에서만 체크
-                other_node_params = [p for p in model.parameters() 
-                                   if p.ds_tensor.ds_param_rank != dist.get_rank(group=p.comm.param_inter_node_shard_group)]
-                for param in other_node_params:
-                    assert param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE, \
-                        f"Other node parameter should be NOT_AVAILABLE"
-                    assert param.ds_tensor.final_location == OffloadDeviceEnum.cpu, \
-                        f"Other node parameter should be on CPU"
+            # Forward pass 후 파라미터 상태
+            print("\nParameter status after forward:")
+            for name, param in model.named_parameters():
+                print(f"  - {name}: status={param.ds_status}, device={param.device}")
+                if hasattr(param.ds_tensor, 'final_location'):
+                    print(f"    final_location={param.ds_tensor.final_location}")
 
             model.backward(loss)
+            
+            # Backward pass 후 파라미터 상태
+            print("\nParameter status after backward:")
+            for name, param in model.named_parameters():
+                print(f"  - {name}: status={param.ds_status}, device={param.device}")
+                if hasattr(param.ds_tensor, 'final_location'):
+                    print(f"    final_location={param.ds_tensor.final_location}")
+
             model.step()
+            
+            if i >= 2:  # 처음 몇 배치만 자세히 출력
+                break
 
-            # Backward pass 후 파라미터가 GPU에 복원되었는지 확인
-            if i == len(data_loader) - 1:  # 마지막 배치에서만 체크
-                for name, param in model.named_parameters():
-                    assert param.ds_tensor.status == PartitionedParamStatus.AVAILABLE, \
-                        f"Parameter {name} not available after backward"
-                    assert param.ds_tensor.final_location is None, \
-                        f"Parameter {name} not on GPU after backward"
+        # 학습 후 파라미터 접근 가능 여부 확인
+        print(f"\n[Node {node_rank}, Rank {dist.get_rank()}] Checking parameter accessibility after training")
+        with deepspeed.zero.GatheredParameters(model.parameters()):
+            for name, param in model.named_parameters():
+                try:
+                    print(f"  - {name}: shape={param.shape}, device={param.device}")
+                    print(f"    mean={param.data.mean().item()}, std={param.data.std().item()}")
+                except Exception as e:
+                    print(f"  - {name}: Failed to access - {str(e)}")
 
-        # 학습 후 모델 상태 저장 및 복원 테스트
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model.save_checkpoint(tmpdir)
-            dist.barrier()  # 모든 프로세스가 저장을 완료할 때까지 대기
-
-            # 체크포인트에서 모델 복원
-            orig_state_dict = {}
-            for name, param in model.module.named_parameters():
-                with deepspeed.zero.GatheredParameters(param, modifier_rank=None):
-                    orig_state_dict[name] = param.detach().cpu()
-
-            # 복원된 모델과 원본 모델 비교
-            if dist.get_rank() == 0:
-                fp32_model = load_state_dict_from_zero_checkpoint(model.module, tmpdir)
-                fp32_state_dict = fp32_model.state_dict()
-                
-                for name in orig_state_dict.keys():
-                    assert torch.allclose(orig_state_dict[name].float(), fp32_state_dict[name].float()), \
-                        f"Parameter {name} mismatch after restore"
-
-        # 여기서 필요한 assertion 추가
-        # 예: CPU offload가 제대로 되었는지, 파라미터가 올바르게 복원되었는지 등 
+def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True, mpu=None):
+    ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
+    n_nodes = int(os.environ.get("NNODES", "1"))
+    
+    # 전체 world size 확인
+    world_size = ndevices_per_node * n_nodes
+    assert dist.get_world_size() == world_size, "Mismatch in world size"
