@@ -1105,6 +1105,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # Replicated vs Partitioned vs Inflight
         param.ds_status = ZeroParamStatus.AVAILABLE
 
+        #gspark: new status to check for where param exists remote, in-node-gpu
+
         # Stores the shape of the original tensor
         param.ds_shape = param.shape
 
