@@ -1,3 +1,4 @@
+import os
 import pytest
 import torch
 import deepspeed
@@ -19,13 +20,22 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
     return train_loader
 
 class TestPenguinInterNodeOffload(DistributedTest):
-    # 1개 노드, 8개 GPU 환경으로 수정
-    world_size = 8
+    @property
+    def world_size(self):
+        # 환경 변수에서 노드 수와 노드당 GPU 수를 읽어옴
+        n_nodes = int(os.environ.get('NNODES', '1'))
+        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
+        return n_nodes * gpus_per_node
 
     def test(self):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("CPU accelerator does not support this test yet")
             
+        # 환경 변수에서 설정 읽어오기
+        n_nodes = int(os.environ.get('NNODES', '1'))
+        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
+        node_rank = int(os.environ.get('NODE_RANK', '0'))
+        
         config_dict = {
             "train_batch_size": 32,
             "gradient_accumulation_steps": 1,
@@ -40,7 +50,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
             "zero_optimization": {
                 "stage": 3,
                 "penguin": {
-                    "shard_size": 8,
+                    "shard_size": gpus_per_node,  # 노드당 GPU 수로 설정
                     "hierarchial_params_gather": True
                 }
             },
