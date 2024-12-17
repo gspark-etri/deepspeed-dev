@@ -107,9 +107,9 @@ class DeepSpeedConfigModel(BaseModel):
         validate_assignment=True,
         use_enum_values=True,
         populate_by_name=True,
-        extra="forbid",
         arbitrary_types_allowed=True,
         protected_namespaces=(),
+        extra='allow',
     )
 
     @field_serializer("dtype", check_fields=False)

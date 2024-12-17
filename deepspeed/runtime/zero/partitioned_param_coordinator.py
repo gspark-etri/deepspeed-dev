@@ -293,6 +293,7 @@ class PartitionedParameterCoordinator:
             [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
 
         if fetch_numel > 0:
+            #gspark: check the event name
             event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
             self._dump_param_ids(event_name, current_submodule.id,
                                  [p.ds_id for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
@@ -451,6 +452,7 @@ class PartitionedParameterCoordinator:
     def __all_gather_params_(self, params: Set[Parameter], forward: bool, quantize: bool = False) -> None:
         """for each partitioned parameter, kick off an async allgather and store
         the work handle for the in flight parameters."""
+        #gspark: fix the function
         partitioned_params = []
         all_gather_numel = 0  # numel = num of elements
         for param in params:
@@ -475,7 +477,13 @@ class PartitionedParameterCoordinator:
                 with get_accelerator().stream(self.__allgather_stream):
                     event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
                     self.__profiler.start_event(event_name)
-                    handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
+                    handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
+
+                    #gspark: if penguin is enabled, we need to add _move_other_inter_params_to_cpu
+                    if self.penguin_comm_groups is not None:
+                        if forward:
+                            self.penguin_comm_groups._move_other_inter_params_to_cpu(param_group)
+
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
                     assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()

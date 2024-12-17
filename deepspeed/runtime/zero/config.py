@@ -6,7 +6,7 @@
 import sys
 from typing import Optional
 from enum import Enum
-from pydantic import Field, model_validator
+from pydantic import Field, model_validator, BaseModel
 from deepspeed.runtime.config_utils import get_scalar_param, pp_int, DeepSpeedConfigModel
 from deepspeed.utils import logger
 from .offload_config import DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig, OffloadDeviceEnum
@@ -81,10 +81,17 @@ class ZeroStageEnum(int, Enum):
     max_stage = 3
 
 
+class PenguinConfig(BaseModel):
+    """Penguin optimization configuration."""
+    shard_size: Optional[int] = None
+    hierarchial_params_gather: bool = False
+
+
 class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
     Sets parameters for ZeRO optimizations.
     """
+    model_config = dict(extra='allow')
 
     stage: ZeroStageEnum = 0
     """
@@ -328,6 +335,9 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
     Override nn.Module apply function, for Stage 3.
     """
+
+    # Penguin config를 중첩 클래스로 변경
+    penguin: Optional[PenguinConfig] = None
 
     # Validators
     @model_validator(mode="after")
