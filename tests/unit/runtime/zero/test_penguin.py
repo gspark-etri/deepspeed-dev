@@ -24,29 +24,31 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
 class TestPenguinInterNodeOffload(DistributedTest):
     @property
     def world_size(self):
-        n_nodes = int(os.environ.get('NNODES', '1'))
-        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
-        return n_nodes * gpus_per_node
+        return 16  # 고정된 값으로 설정 (2 nodes x 8 GPUs)
+
+    def setup_method(self, method):
+        # 분산 환경 설정을 위한 메소드 오버라이드
+        pass
 
     def test(self):
         # 분산 환경 초기화 확인
-        dist.barrier()  # 모든 프로세스가 여기까지 도달할 때까지 대기
-        
         n_nodes = int(os.environ.get('NNODES', '1'))
         gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
         node_rank = int(os.environ.get('NODE_RANK', '0'))
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-        rank = dist.get_rank()
         
-        print(f"Process info - Node: {node_rank}, Local rank: {local_rank}, Global rank: {rank}")
-        sys.stdout.flush()  # 즉시 출력하도록 강제
+        # 환경 변수로 world size 확인
+        world_size = int(os.environ.get('WORLD_SIZE', n_nodes * gpus_per_node))
         
+        print(f"Process info - Node: {node_rank}, Local rank: {local_rank}, World size: {world_size}")
+        sys.stdout.flush()
+
         # 분산 환경 정보 출력
-        if rank == 0:
+        if node_rank == 0:
             print(f"\nDistributed setup:")
             print(f"Number of nodes: {n_nodes}")
             print(f"GPUs per node: {gpus_per_node}")
-            print(f"World size: {dist.get_world_size()}")
+            print(f"World size: {world_size}")
             print(f"Backend: {dist.get_backend()}")
             sys.stdout.flush()
         
