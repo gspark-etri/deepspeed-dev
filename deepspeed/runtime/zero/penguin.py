@@ -345,7 +345,7 @@ class Penguin_Init(Init):
                                          requires_grad=False).view(-1)
             param_tensors.append(param_tensor)
 
-        # 노드 간 all-gather (동기)
+        # 노드 간 all-gather
         inter_outputs = []
         inter_inputs = []
         for i, p in enumerate(params):
@@ -353,13 +353,12 @@ class Penguin_Init(Init):
             _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
             inter_outputs.append(_out)
             inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
-        
-        # 동기 all-gather 수행 (IllegalWork 에러 방지)
-        dist.all_gather_coalesced(
-            inter_outputs, 
-            inter_inputs, 
-            group=inter_node_comm_group,
-            async_op=False  # 동기 실행
+
+        # 명시적 함수 이름으로 all_gather_coalesced 호출
+        dist.all_gather_coalesced_._exec_func(
+            inter_outputs,
+            inter_inputs,
+            group=inter_node_comm_group
         )
 
         # 노드 내 all-gather 준비
@@ -370,7 +369,7 @@ class Penguin_Init(Init):
                 (inter_node_size, intra_node_size, p.ds_tensor.ds_numel)
             ).narrow(1, local_rank, 1)
             
-            # 데이터 복사 (inter_handle.wait() 필요 없음)
+            # 데이터 복사
             with torch.no_grad():
                 param_chunk.copy_(inter_outputs[i].view(param_chunk.size()))
                 
