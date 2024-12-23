@@ -69,22 +69,34 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
 
 
 class PenguinParameter(Parameter):
+    """DeepSpeed Penguin Parameter class for parameter partitioning"""
+    
     def __init__(self, data=None, requires_grad=True):
         super().__init__(data, requires_grad=requires_grad)
-        # 필요한 속성들 초기화
+        # DeepSpeed 기본 속성들
         self.ds_id = None
         self.ds_status = ZeroParamStatus.AVAILABLE
         self.ds_tensor = None
+        self.ds_shape = None if data is None else data.shape
         self.ds_numel = None if data is None else data.numel()
+        self.ds_param_type = None
+        
+        # Penguin 전용 속성
         self.penguin_cpu_buffer = None
+        self.ds_process_group = None
 
     def partition(self):
+        """Partition the parameter to CPU buffer"""
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
             return
         with torch.no_grad():
             self.penguin_cpu_buffer.copy_(self.data.view(-1))
             self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
             self.ds_status = ZeroParamStatus.NOT_AVAILABLE
+            
+    def ds_summary(self):
+        """Return a summary string of the parameter's DeepSpeed status"""
+        return f"Data type: {self.dtype}, Shape: {self.ds_shape}, Status: {self.ds_status}"
 
 
 class Penguin_Init(Init):
