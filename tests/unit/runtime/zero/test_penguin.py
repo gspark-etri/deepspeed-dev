@@ -96,7 +96,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
         logger.info(f"Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
         
         config_dict = {
-            "train_batch_size": 64,
+            "train_batch_size": 16,
             "gradient_accumulation_steps": 1,
             "train_micro_batch_size_per_gpu": 4,
             "steps_per_print": 1,
