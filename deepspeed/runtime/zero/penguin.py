@@ -354,12 +354,14 @@ class Penguin_Init(Init):
             inter_outputs.append(_out)
             inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
 
-        # 명시적 함수 이름으로 all_gather_coalesced 호출
-        dist.all_gather_coalesced_._exec_func(
-            inter_outputs,
-            inter_inputs,
-            group=inter_node_comm_group
-        )
+        # 동기 all-gather 수행
+        with torch.cuda.stream(torch.cuda.Stream()):
+            for out, inp in zip(inter_outputs, inter_inputs):
+                dist.all_gather_into_tensor(
+                    out,
+                    inp,
+                    group=inter_node_comm_group
+                )
 
         # 노드 내 all-gather 준비
         intra_outputs = []
