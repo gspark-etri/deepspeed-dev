@@ -110,6 +110,13 @@ def create_penguin_comm_groups(
     # global rank
     global_rank = dist.get_rank()
 
+    if shard_size > world_size:
+        raise ValueError(f"shard_size ({shard_size}) cannot be larger than world_size ({world_size})")
+    
+    # shard_size가 world_size의 약수인지 확인
+    if world_size % shard_size != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by shard_size ({shard_size})")
+
     config = _generate_penguin_config(world_size, ndevices_per_node, shard_size, 1)
     ranks_of_shard_group = config['shard_groups']
     ranks_of_repli_group = config['replicate_groups']

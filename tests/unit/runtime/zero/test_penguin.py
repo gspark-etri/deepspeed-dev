@@ -24,12 +24,7 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
 class TestPenguinInterNodeOffload(DistributedTest):
     @property
     def world_size(self):
-        # 실제 분산 환경의 world_size를 반환
-        if dist.is_initialized():
-            return dist.get_world_size()
-        n_nodes = int(os.environ.get('NNODES', '1'))
-        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
-        return n_nodes * gpus_per_node
+        return 16  # 2 nodes * 8 GPUs - 명시적으로 설정
         
     @property 
     def gpu_count(self):
@@ -104,13 +99,13 @@ class TestPenguinInterNodeOffload(DistributedTest):
         gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
         world_size = n_nodes * gpus_per_node
         
-        # batch size 계산
+        # batch size 계산 - self.world_size 사용
         micro_batch = 4  # micro batch size per GPU
         grad_acc = 1     # gradient accumulation steps
-        train_batch = micro_batch * grad_acc * world_size  # 4 * 1 * 16 = 64
+        train_batch = micro_batch * grad_acc * self.world_size  # 4 * 1 * 16 = 64
         
         config_dict = {
-            "train_batch_size": train_batch,  # 자동 계산
+            "train_batch_size": train_batch,
             "gradient_accumulation_steps": grad_acc,
             "train_micro_batch_size_per_gpu": micro_batch,
             "steps_per_print": 1,
@@ -128,7 +123,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 }
             },
             "distributed": {
-                "world_size": world_size,  # world_size 명시
+                "world_size": self.world_size,  # 명시적으로 world_size 설정
                 "distributed_backend": "nccl"
             }
         }
