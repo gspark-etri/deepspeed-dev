@@ -27,10 +27,12 @@ from deepspeed import comm as dist
 from deepspeed.runtime.utils import see_memory_usage, DummyOptim
 from .zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.runtime.zero.utils import is_zero_supported_optimizer, ZeRORuntimeException
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 from deepspeed.runtime.zero.config import ZERO_OPTIMIZATION
+from deepspeed.runtime.zero.penguin import Penguin_Optimizer
 
 from deepspeed.runtime.fp16.fused_optimizer import FP16_Optimizer
 from deepspeed.runtime.fp16.unfused_optimizer import FP16_UnfusedOptimizer
@@ -1537,16 +1539,31 @@ class DeepSpeedEngine(Module):
 
         return optimizer
 
-    def _configure_zero_optimizer(self, optimizer):
+    def _configure_zero_optimizer(self, *args, **kwargs):
         zero_stage = self.zero_optimization_stage()
 
+        if zero_stage == 3:
+            if 'penguin' in self.zero_optimization():
+                # Use Penguin optimizer
+                log_dist('Creating Penguin ZeRO stage 3 optimizer', ranks=[0])
+                optimizer = Penguin_Optimizer(
+                    module=self.module,
+                    optimizer=kwargs.get('optimizer', None),
+                    timers=self.timers if self.wall_clock_breakdown() else NoopTimer(),
+                    ds_config=self.config,
+                    **self._get_zero_optimizer_config()
+                )
+                return optimizer
+
+        # 기존 코드 유지
         mics_shard_size = self.mics_shard_size()
         model_dtype, gradient_accumulation_dtype = self.get_data_types()
-
         timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
 
-        if optimizer is None:
+        if kwargs.get('optimizer') is None:
             optimizer = DummyOptim(list(self.module.parameters()))
+        else:
+            optimizer = kwargs['optimizer']
 
         if self.zero_legacy_stage1():
             raise Exception(
@@ -2605,7 +2622,6 @@ class DeepSpeedEngine(Module):
             tensor_list = [
                 value.new_empty(max_size,
                                 value.size()[1]) for _ in range(dist.get_world_size(group=dp_group))
-            ]
 
         dist.all_gather(tensor_list, value, group=dp_group)
         tensors = []

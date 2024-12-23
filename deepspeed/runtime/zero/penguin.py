@@ -28,6 +28,7 @@ from torch import Tensor
 from torch.nn import Parameter
 import json
 import os
+from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator
 
 
 def has_hierarchical_all_gather_groups(comm_groups: Penguin_CommGroups):
@@ -95,6 +96,36 @@ class PenguinParameter(Parameter):
             return self.ds_process_group._flat_all_gather_with_coalescing_manager(params)
         else:
             raise NotImplementedError("Non-coalescing manager all-gather not supported")
+
+
+class PenguinPartitionedParameterCoordinator(PartitionedParameterCoordinator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.penguin_comm_groups = None
+
+    def set_penguin_comm_groups(self, comm_groups):
+        self.penguin_comm_groups = comm_groups
+
+    def __all_gather_params_(self, param_list, forward=False, quantize=False):
+        """Override the parent class method to support penguin communication groups"""
+        if len(param_list) == 0:
+            return
+
+        if self.penguin_comm_groups is not None:
+            # Use penguin communication groups
+            param_group = []
+            for param in param_list:
+                param_group.append(param)
+                if len(param_group) == self.max_group_size:
+                    handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
+                    self.handles.append(handle)
+                    param_group = []
+            if len(param_group) > 0:
+                handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
+                self.handles.append(handle)
+        else:
+            # Use default implementation
+            super().__all_gather_params_(param_list, forward, quantize)
 
 
 class Penguin_Init(Init):
@@ -228,6 +259,16 @@ class Penguin_Init(Init):
             ds_process_group,
             hierarchical_allgather=self.hierarchial_params_gather,
             mpu=mpu)
+
+        # Create custom parameter coordinator
+        self.param_coordinator = PenguinPartitionedParameterCoordinator(
+            max_group_size=self.max_group_size,
+            param_persistence_threshold=self.param_persistence_threshold,
+            model_persistence_threshold=self.model_persistence_threshold,
+            dp_process_group=self.ds_process_group
+        )
+        # Set penguin communication groups
+        self.param_coordinator.set_penguin_comm_groups(self.penguin_comm_groups)
 
         super().__init__(module, data_parallel_group, mem_efficient_linear, remote_device, pin_memory,
                          config_dict_or_path, config, enabled, dtype, mpu)
@@ -487,15 +528,9 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
                          offload_optimizer_config, offload_param_config, sub_group_size, offload_ratio, mpu, clip_grad,
                          gradient_accumulation_dtype, communication_data_type, postscale_gradients,
                          gradient_predivide_factor, gradient_accumulation_steps, elastic_checkpoint, aio_config)
-        first_param = next(module.parameters())
-        # overload the dp_process_group and partition_count
-        assert hasattr(first_param, "comm"), " ".join([
-            "Sharded parameters don't have the Penguin_CommGroups attached.",
-            "Might due to the use of deepspeed.zero.Init context for initializing the weights.",
-            "To use Penguin sharding, please use deepspeed.zero.Penguin_Init instead for initializing parameter."
-        ])
-        self.dp_process_group = first_param.comm.param_shard_group
-        self.partition_count = first_param.comm.param_shard_size
+        # Get first parameter's communication groups
+        first_param = next(self.module.parameters())
+        self.penguin_comm_groups = first_param.comm
 
     def initialize_ds_offload(
         self,
@@ -505,18 +540,15 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
         return Penguin_Offload(*args, **kwargs)
 
     def partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
+        """Override partition_grads to use penguin communication groups"""
         grad_buffers = super().partition_grads(params_to_release, grad_partitions)
-        # perform all-reduce among replication groups
-        # the function will perform accumulation boundary check
+        # Perform all-reduce among replication groups
         self.allreduce_penguin_shard_grads(params_to_release, grad_buffers)
 
     @instrument_w_nvtx
     def allreduce_penguin_shard_grads(self, params, partitioned_grads_buffers: List[Tensor]):
-        """
-        """
-        # TODO: improve the condition check
-        if not self.is_gradient_accumulation_boundary or \
-            len(partitioned_grads_buffers) == 0:
+        """All-reduce gradients using penguin communication groups"""
+        if not self.is_gradient_accumulation_boundary or len(partitioned_grads_buffers) == 0:
             return
 
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
@@ -532,7 +564,7 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
             scale_tensors(partitioned_grads_buffers, param_repli_size)
             dist.all_reduce_coalesced(tensors=partitioned_grads_buffers, group=param_repli_group)
         else:
-            # manually coalescing all-reduce
+            # Manually coalescing all-reduce
             aggregated_buffer: Tensor = torch.cat(partitioned_grads_buffers)
             aggregated_buffer.div_(param_repli_size)
             dist.all_reduce(aggregated_buffer, group=param_repli_group)
