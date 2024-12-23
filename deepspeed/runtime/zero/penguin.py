@@ -98,36 +98,6 @@ class PenguinParameter(Parameter):
             raise NotImplementedError("Non-coalescing manager all-gather not supported")
 
 
-class PenguinPartitionedParameterCoordinator(PartitionedParameterCoordinator):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.penguin_comm_groups = None
-
-    def set_penguin_comm_groups(self, comm_groups):
-        self.penguin_comm_groups = comm_groups
-
-    def __all_gather_params_(self, param_list, forward=False, quantize=False):
-        """Override the parent class method to support penguin communication groups"""
-        if len(param_list) == 0:
-            return
-
-        if self.penguin_comm_groups is not None:
-            # Use penguin communication groups
-            param_group = []
-            for param in param_list:
-                param_group.append(param)
-                if len(param_group) == self.max_group_size:
-                    handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
-                    self.handles.append(handle)
-                    param_group = []
-            if len(param_group) > 0:
-                handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
-                self.handles.append(handle)
-        else:
-            # Use default implementation
-            super().__all_gather_params_(param_list, forward, quantize)
-
-
 class Penguin_Init(Init):
 
     def __init__(self,
@@ -142,76 +112,8 @@ class Penguin_Init(Init):
                  enabled=True,
                  dtype=None,
                  mpu=None):
-        """A context manager to partition the model parameters during the model
-        construction with Penguin partition strategy. Model states are partitioned
-        to the number of devices specified via ``penguin_shard_size`` field in the
-        deepspeed config json file. The context manager also introduces
-        hierarchical communication method to reduce the cost of inter-node
-        communications, which can be enabled with
-        ``penguin_hierarchical_params_gather`` field in deepspeed config.
-
-        Args:
-            module (``torch.nn.Module``, optional): If provided, partition the model as
-                if it was constructed in the context.
-            data_parallel_group (``deepspeed.comm`` process group, optional):
-                The group of processes to partition among. Defaults to all processes.
-                Synonymous with sequence data parallel group for param partitioning
-                across both sequence and data parallel groups.
-            mem_efficient_linear (bool, optional): Replace
-                torch.nn.functional.linear with an implementation that allows
-                DeepSpeed to partition parameters. Defaults to ``True``.
-            remote_device (string, optional): The initial device to store model
-                weights e.g., ``cpu``, ``nvme``. Passing ``"cpu"`` will create the model in CPU
-                memory. The model may still be moved to GPU based on the
-                offload settings for training. Defaults to param offload device if a config is
-                defined, otherwise GPU.
-            pin_memory (bool, optional): Potentially increase performance by
-                using pinned memory for model weights. ``remote_device`` must be
-                ``"cpu"``. Defaults to pin_memory value in config, otherwise ``False``.
-            config_dict_or_path (dict or ``json file``, optional): If provided, provides configuration
-                for swapping fp16 params to NVMe.
-            config (dict or ``json file``, optional): Deprecated, use config_dict_or_path instead.
-            enabled (bool, optional): If ``False``, this context has no
-                effect. Defaults to ``True``.
-            dtype (``dtype``, optional): Can be used to change the data type of the parameters.
-                Supported options are ``torch.half`` and ``torch.float``. Defaults to ``None``
-            mpu (``object``, optional): A model parallelism unit object that implements get_{model,data}_parallel_{rank,group,world_size}.
-
-        This context follows the same logic as ``deepspeed.zero.Init()``, but
-        with the modification for partition size of each parameter.
-
-        Examples
-        --------
-
-        #. Allocate a model and partition it among all processes:
-
-            .. code-block:: python
-                # the config_dict_or_path is required to let the context manager know
-                # how partition the parameters.
-                # The configuration has to include the field ``penguin_shard_size``
-                with deepspeed.zero.Penguin_Init(config_dict_or_path=ds_config):
-                    model = MyLargeModel()
-
-
-        #. Allocate a model in pinned CPU memory and partition it among a subgroup of processes:
-
-            .. code-block:: python
-
-                with deepspeed.zero.Penguin_Init(data_parallel_group=mpu.get_data_parallel_group(),
-                                              remote_device="cpu",
-                                              pin_memory=True
-                                              config_dict_or_path=ds_config):
-                    model = MyLargeModel()
-
-
-        #. Partition an already-allocated model in CPU memory:
-
-            .. code-block:: python
-
-                model = deepspeed.zero.Penguin_Init(module=model,
-                                                 config_dict_or_path=ds_config)
-        """
-
+        """Penguin initialization context"""
+        
         assert config_dict_or_path is not None, "Must provide configuration for Penguin Initialization"
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path, mpu)
         
@@ -235,43 +137,31 @@ class Penguin_Init(Init):
             raise ValueError("penguin shard_size must be specified in config")
         
         self.hierarchial_params_gather = penguin_config.get('hierarchial_params_gather', False)
-        
-        if not dist.is_initialized():
-            dist.init_distributed()
-            assert dist.is_initialized(), "Parameters cannot be scattered without initializing deepspeed.comm"
 
-        if data_parallel_group is None:
-            ds_process_group = dist.get_world_group()
-        else:
-            ds_process_group = data_parallel_group
+        # Init 클래스의 속성들 초기화
+        self.max_group_size = zero_config.get('max_group_size', 1000000000000)
+        self.param_persistence_threshold = zero_config.get('param_persistence_threshold', 100000)
+        self.model_persistence_threshold = zero_config.get('model_persistence_threshold', sys.maxsize)
+        self.dp_process_group = data_parallel_group
 
-        if sequence_data_parallel_group is not None:
-            logger.warning(
-                f"sequence_data_parallel_group' is deprecated and will be removed. Use 'data_parallel_group' instead.")
-            if data_parallel_group is not None:
-                raise ValueError(
-                    "Both 'data_parallel_group' and 'sequence_data_parallel_group' were specified. Please provide only one of these arguments."
-                )
-            self.ds_process_group = sequence_data_parallel_group
-
+        # 통신 그룹 초기화
         self.penguin_comm_groups = create_penguin_comm_groups(
-            self.shard_size,
-            ds_process_group,
-            hierarchical_allgather=self.hierarchial_params_gather,
-            mpu=mpu)
-
-        # Create custom parameter coordinator
-        self.param_coordinator = PenguinPartitionedParameterCoordinator(
-            max_group_size=self.max_group_size,
-            param_persistence_threshold=self.param_persistence_threshold,
-            model_persistence_threshold=self.model_persistence_threshold,
-            dp_process_group=self.ds_process_group
+            shard_size=self.shard_size,
+            hierarchial_params_gather=self.hierarchial_params_gather
         )
-        # Set penguin communication groups
-        self.param_coordinator.set_penguin_comm_groups(self.penguin_comm_groups)
-
-        super().__init__(module, data_parallel_group, mem_efficient_linear, remote_device, pin_memory,
-                         config_dict_or_path, config, enabled, dtype, mpu)
+        
+        # 부모 클래스 초기화
+        super().__init__(module=module,
+                        data_parallel_group=data_parallel_group,
+                        sequence_data_parallel_group=sequence_data_parallel_group,
+                        mem_efficient_linear=mem_efficient_linear,
+                        remote_device=remote_device,
+                        pin_memory=pin_memory,
+                        config_dict_or_path=config_dict_or_path,
+                        config=config,
+                        enabled=enabled,
+                        dtype=dtype,
+                        mpu=mpu)
 
     def _convert_to_deepspeed_param(self, param):
         # 먼저 부모 클래스의 변환을 수행하여 기본 속성들 초기화
@@ -287,22 +177,6 @@ class Penguin_Init(Init):
         
         # 통신 그룹 설정
         param.comm = self.penguin_comm_groups
-        
-        # record existing all_gather_coalesced implementation
-        old_all_gather_coalesced = param.all_gather_coalesced
-
-        def _param_all_gather_coalesced(params, param_buffers=None, **kwargs):
-            mics_comm_groups: Penguin_CommGroups = params[0].comm
-            hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
-            if dist.has_coalescing_manager() and hierarchical_all_gather:
-                return self._hierarchical_all_gather_params(params, param_buffers)
-            elif dist.has_coalescing_manager():
-                return self._flat_all_gather_with_coalescing_manager(params, param_buffers)
-            else:
-                return old_all_gather_coalesced(params, **kwargs)
-
-        # change the all_gather_coalesced method
-        param.all_gather_coalesced = _param_all_gather_coalesced
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme

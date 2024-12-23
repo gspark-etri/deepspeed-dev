@@ -84,136 +84,67 @@ class Penguin_CommGroups:
                     param.ds_tensor.final_location = None
 
 
-def create_penguin_comm_groups(
-    shard_size,
-    dp_group,
-    hierarchical_allgather=True,
-    mpu=None,
-):
+def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
+    """Create communication groups for Penguin partitioning strategy
+    
+    Args:
+        shard_size: Number of shards for parameter partitioning
+        hierarchial_params_gather: Whether to use hierarchical parameter gathering
     """
-    create shard-group, replicate-group from config_file
-    TODO: consider broadcast the config from rank0
-
-    Returns:
-        Penguin_CommGroups
-    """
-    # env var for debugging purpose
-    ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
-    n_nodes = int(os.environ.get("NNODES", "1"))
-    
-    # 디버깅을 위한 로그 추가
-    logger.info(f"NNODES={n_nodes}, NDEV_PER_NODE={ndevices_per_node}")
-    logger.info(f"shard_size={shard_size}, world_size={dist.get_world_size()}")
-    
-    # n_span_nodes 계산 수정
-    n_span_nodes = (shard_size + ndevices_per_node - 1) // ndevices_per_node
-    logger.info(f"n_span_nodes calculation: {n_span_nodes} = ({shard_size} + {ndevices_per_node} - 1) // {ndevices_per_node}")
-    
-    assert n_span_nodes > 1, "sharding spans on single node, no need for hierarchy allgather"
-
-    groups = Penguin_CommGroups()
-
-    if mpu is not None:
-        assert dp_group == mpu.get_data_parallel_group()
-
-    # full size of the world
+    # Get world info
     world_size = dist.get_world_size()
-    # global rank
     global_rank = dist.get_rank()
-
+    local_rank = get_accelerator().current_device()
+    ndevices_per_node = get_accelerator().device_count()
+    
     if shard_size > world_size:
         raise ValueError(f"shard_size ({shard_size}) cannot be larger than world_size ({world_size})")
-    
-    # shard_size가 world_size의 약수인지 확인
     if world_size % shard_size != 0:
         raise ValueError(f"world_size ({world_size}) must be divisible by shard_size ({shard_size})")
 
-    config = _generate_penguin_config(world_size, ndevices_per_node, shard_size, 1)
-    ranks_of_shard_group = config['shard_groups']
-    ranks_of_repli_group = config['replicate_groups']
-    if len(ranks_of_repli_group) == 0:
-        assert len(ranks_of_shard_group) == 1, "replicate groups are empty only for single shard group"
-        for r in ranks_of_shard_group[0]:
-            ranks_of_repli_group.append([r])
+    groups = Penguin_CommGroups()
 
-    # for simplicity
-    assert _sizes_all_same(ranks_of_repli_group), "replicate groups must have the same size"
-    assert _sizes_all_same(ranks_of_shard_group), "shard groups must have the same size"
+    # Create shard groups
+    for i in range(0, world_size, shard_size):
+        ranks = list(range(i, min(i + shard_size, world_size)))
+        group = dist.new_group(ranks)
+        if global_rank in ranks:
+            groups.param_shard_group = group
+            groups.param_shard_size = len(ranks)
+            groups.param_shard_rank = dist.get_rank(group)
 
-    assert sum([len(g) for g in ranks_of_shard_group]) == dist.get_world_size(), "all sharded ranks "
-    if len(ranks_of_shard_group) > 1:  # if only shard on one group then no need for replicate groups
-        assert len(ranks_of_shard_group) == len(
-            ranks_of_repli_group[0]), "number of shard groups must equal to the size of each replicate group"
+    # Create replication groups
+    num_replicas = world_size // shard_size
+    if num_replicas > 1:
+        for i in range(shard_size):
+            ranks = list(range(i, world_size, shard_size))
+            group = dist.new_group(ranks)
+            if global_rank in ranks:
+                groups.param_repli_group = group
+                groups.param_repli_size = len(ranks)
+                groups.param_repli_rank = dist.get_rank(group)
+    else:
+        groups.param_repli_group = None
+        groups.param_repli_size = 1
+        groups.param_repli_rank = 0
 
-    global_rank = dist.get_rank()
-    # create shard groups
-    for shard_ranks in ranks_of_shard_group:
-        _group = dist.new_group(shard_ranks)
-        if global_rank in shard_ranks:
-            groups.param_shard_group = _group
-            groups.param_shard_size = len(shard_ranks)
-            groups.param_shard_rank = dist.get_rank(_group)
-            logger.info(f'rank {global_rank}, shard group'
-                        f' {groups.param_shard_rank}/{dist.get_world_size(group=_group)}')
+    # Create hierarchical groups if needed
+    if hierarchial_params_gather:
+        # Create intra-node groups
+        local_world_size = ndevices_per_node
+        for i in range(0, world_size, local_world_size):
+            ranks = list(range(i, min(i + local_world_size, world_size)))
+            group = dist.new_group(ranks)
+            if global_rank in ranks:
+                groups.param_intra_node_group = group
 
-    # create replicate groups
-    for repli_ranks in ranks_of_repli_group:
-        if len(repli_ranks) > 1:
-            _group = dist.new_group(repli_ranks)
-            if global_rank in repli_ranks:
-                groups.param_repli_group = _group
-                groups.param_repli_size = len(repli_ranks)
-                groups.param_repli_rank = dist.get_rank(group=_group)
-                logger.info(f'rank {global_rank} '
-                            f'replicate group {groups.param_repli_rank}/{dist.get_world_size(group=_group)}')
-        else:
-            groups.param_repli_group = None
-            groups.param_repli_size = 1
-            groups.param_repli_rank = 0
-            logger.info(f'rank {global_rank} replicate group 0/1')
+        # Create inter-node groups
+        for i in range(local_world_size):
+            ranks = list(range(i, world_size, local_world_size))
+            group = dist.new_group(ranks)
+            if global_rank in ranks:
+                groups.param_inter_node_shard_group = group
 
-    # assign shard group size as world size
-    assert groups.param_shard_size == len(ranks_of_shard_group[0])
-
-    if hierarchical_allgather:
-        # create hierarchy inter-node, intra-node groups
-        # n_span_nodes = config['shard_span']
-        n_span_nodes = config['span_nodes']
-        assert n_span_nodes > 1, "sharding spans on single node, no need for hierarchy allgather"
-        assert len(ranks_of_shard_group[0]) % n_span_nodes == 0
-
-        n_gpu_per_node = len(ranks_of_shard_group[0]) // n_span_nodes
-        intra_node_ranks_group = []
-        inter_node_ranks_group = []
-        for shard_group in ranks_of_shard_group:
-            _intra_node_ranks = []
-            for i in range(0, len(shard_group), n_gpu_per_node):
-                _intra_node_ranks.append(shard_group[i:i + n_gpu_per_node])
-            _inter_node_ranks = []
-            for i in range(n_gpu_per_node):
-                _ranks = [_g[i] for _g in _intra_node_ranks]
-                _inter_node_ranks.append(_ranks)
-
-            intra_node_ranks_group.append(_intra_node_ranks)
-            inter_node_ranks_group.append(_inter_node_ranks)
-
-        _log_rank0(f"create for hierarchy all-gather groups: intra nodes {intra_node_ranks_group}")
-        _log_rank0(f"create for hierarchy all-gather groups: inter nodes {inter_node_ranks_group}")
-
-        # create communicators
-        for shard_group in intra_node_ranks_group:
-            for intra_node_ranks in shard_group:
-                _group = dist.new_group(intra_node_ranks)
-                if global_rank in intra_node_ranks:
-                    groups.param_intra_node_group = _group
-                _log_rank0(f'create group for intra node ranks {intra_node_ranks}')
-
-        for shard_group in inter_node_ranks_group:
-            for inter_node_ranks in shard_group:
-                _group = dist.new_group(inter_node_ranks)
-                if global_rank in inter_node_ranks:
-                    groups.param_inter_node_shard_group = _group
-                _log_rank0(f'create group for inter node ranks {inter_node_ranks}')
     return groups
 
 
