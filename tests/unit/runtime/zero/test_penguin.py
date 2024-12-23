@@ -24,14 +24,31 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
 class TestPenguinInterNodeOffload(DistributedTest):
     @property
     def world_size(self):
-        return 16  # 고정된 값으로 설정 (2 nodes x 8 GPUs)
-
+        return 16  # 2 nodes x 8 GPUs
+        
+    @property 
+    def gpu_count(self):
+        # 실제 사용 가능한 GPU 수를 반환
+        return get_accelerator().device_count()
+        
     def setup_method(self, method):
-        # 분산 환경 설정을 위한 메소드 오버라이드
+        # 분산 환경이 이미 설정되어 있으므로 skip
         pass
-
+        
+    def init_distributed(self):
+        # 분산 환경이 이미 설정되어 있으므로 skip
+        pass
+        
     def test(self):
-        # 분산 환경 초기화 확인
+        # GPU 체크를 우회
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl',
+                init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}',
+                world_size=int(os.environ['WORLD_SIZE']),
+                rank=int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+            )
+            
         n_nodes = int(os.environ.get('NNODES', '1'))
         gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
         node_rank = int(os.environ.get('NODE_RANK', '0'))
@@ -191,3 +208,19 @@ def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True
     # 전체 world size 확인
     world_size = ndevices_per_node * n_nodes
     assert dist.get_world_size() == world_size, "Mismatch in world size"
+
+def main():
+    # DeepSpeed launcher가 제공하는 local_rank 사용
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    
+    # GPU 설정
+    torch.cuda.set_device(local_rank)
+    
+    # 분산 환경 초기화는 DeepSpeed launcher가 처리
+    
+    # 테스트 인스턴스 생성 및 실행
+    test = TestPenguinInterNodeOffload()
+    test.test()
+
+if __name__ == "__main__":
+    main()
