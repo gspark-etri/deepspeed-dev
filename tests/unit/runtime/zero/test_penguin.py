@@ -53,6 +53,10 @@ class TestPenguinInterNodeOffload(DistributedTest):
         world_size = int(os.environ["WORLD_SIZE"])  # should be 16
         node_rank = int(os.environ.get('NODE_RANK', '0'))
         
+        # batch size 계산 추가
+        batch_size_per_gpu = 4  # micro batch size per GPU
+        train_batch_size = world_size * batch_size_per_gpu
+        
         config_dict = {
             "train_batch_size": train_batch_size,
             "train_micro_batch_size_per_gpu": batch_size_per_gpu,
