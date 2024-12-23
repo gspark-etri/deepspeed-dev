@@ -45,8 +45,12 @@ class TestPenguinInterNodeOffload(DistributedTest):
         # DeepSpeed 분산 환경 초기화
         deepspeed.init_distributed("nccl")
         
+        # 환경변수 설정
+        os.environ['NNODES'] = '2'  # 2개 노드
+        os.environ['NDEV_PER_NODE'] = '8'  # 노드당 8개 GPU
+        
         rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+        world_size = int(os.environ["WORLD_SIZE"])  # should be 16
         node_rank = int(os.environ.get('NODE_RANK', '0'))
         
         # batch size 계산
@@ -67,7 +71,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 "stage": 3,
                 "penguin": {
                     "shard_size": 8,  # GPUs per node
-                    "hierarchial_params_gather": True
+                    "hierarchial_params_gather": True  # 다시 True로 설정
                 },
                 "allgather_bucket_size": 1e3,
                 "reduce_bucket_size": 1e3,
