@@ -122,9 +122,10 @@ class TestPenguinInterNodeOffload(DistributedTest):
                     "hierarchial_params_gather": True
                 }
             },
-            "distributed": {
-                "world_size": self.world_size,  # 명시적으로 world_size 설정
-                "distributed_backend": "nccl"
+            "mesh_config": {  # mesh_device 설정 추가
+                "mesh_shape": [self.world_size],
+                "placements": ["data_parallel"],
+                "mesh_device": "cuda"
             }
         }
         
@@ -152,6 +153,15 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 logger.info(f"  Loss: {loss.item()}, device={loss.device}")
                 return loss
 
+        # Penguin_Init 전에 분산 환경 확인
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl',
+                init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}',
+                world_size=self.world_size,
+                rank=int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+            )
+        
         with deepspeed.zero.Penguin_Init(config_dict_or_path=config_dict):
             model = SimpleModel(hidden_dim)
             logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Model initialized with Penguin")
