@@ -86,8 +86,15 @@ class PenguinParameter(Parameter):
         
     def all_gather_coalesced(self, params, **kwargs):
         """Coalesced all-gather operation for parameter groups"""
-        # forward 파라미터 무시하고 기본 동작 수행
-        return self.comm.all_gather_coalesced(params)
+        mics_comm_groups: Penguin_CommGroups = params[0].comm
+        hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
+        
+        if dist.has_coalescing_manager() and hierarchical_all_gather:
+            return self.ds_process_group._hierarchical_all_gather_params(params)
+        elif dist.has_coalescing_manager():
+            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params)
+        else:
+            raise NotImplementedError("Non-coalescing manager all-gather not supported")
 
 
 class Penguin_Init(Init):
@@ -228,8 +235,9 @@ class Penguin_Init(Init):
     def _convert_to_deepspeed_param(self, param):
         # 먼저 부모 클래스의 변환을 수행하여 기본 속성들 초기화
         super()._convert_to_deepspeed_param(param)
+        param.__class__ = PenguinParameter
         
-        # 그 다음 penguin 전용 속성 추가
+        # penguin 전용 속성 추가
         param.penguin_cpu_buffer = torch.empty(
             param.ds_numel,
             dtype=param.dtype,
@@ -238,6 +246,22 @@ class Penguin_Init(Init):
         
         # 통신 그룹 설정
         param.comm = self.penguin_comm_groups
+        
+        # record existing all_gather_coalesced implementation
+        old_all_gather_coalesced = param.all_gather_coalesced
+
+        def _param_all_gather_coalesced(params, param_buffers=None, **kwargs):
+            mics_comm_groups: Penguin_CommGroups = params[0].comm
+            hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
+            if dist.has_coalescing_manager() and hierarchical_all_gather:
+                return self._hierarchical_all_gather_params(params, param_buffers)
+            elif dist.has_coalescing_manager():
+                return self._flat_all_gather_with_coalescing_manager(params, param_buffers)
+            else:
+                return old_all_gather_coalesced(params, **kwargs)
+
+        # change the all_gather_coalesced method
+        param.all_gather_coalesced = _param_all_gather_coalesced
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
@@ -260,40 +284,40 @@ class Penguin_Init(Init):
         return params, params_buffers
 
     def _flat_all_gather_with_coalescing_manager(self, params, params_buffers=None):
-        """"""
-        # must have to change the status of the param
-        # and ensure they are on the device
+        """Flat all-gather with coalescing manager"""
+        # 파라미터 준비
         params, params_buffers = self._pre_all_gather(params, params_buffers)
-
-        penguin_comm_groups: Penguin_CommGroups = params[0].comm
-        param_shard_size = penguin_comm_groups.param_shard_size
-
+        
+        # 출력 텐서 준비
         output_tensors = []
         input_tensors = []
         for i, p in enumerate(params):
-            t_size = p.ds_tensor.ds_numel * param_shard_size
+            t_size = p.ds_tensor.ds_numel * self.shard_size
             if params_buffers is not None and params_buffers[i] is not None:
-                assert params_buffers[i].numel(
-                ) == t_size, f'params_to_gather_buffers[{i}] size {params_buffers[i].numel()} does not match with t_size {t_size}'
                 flat_out = params_buffers[i]
             else:
                 flat_out = torch.empty(t_size, dtype=p.dtype, device=self.local_device, requires_grad=False).view(-1)
             output_tensors.append(flat_out)
-            _flat_input = p.ds_tensor.data.view(-1)
-            input_tensors.append(_flat_input)
+            input_tensors.append(p.ds_tensor.data.view(-1))
 
-        all_gather_handle = dist.all_gather_coalesced(output_tensors,
-                                                      input_tensors,
-                                                      group=penguin_comm_groups.param_shard_group,
-                                                      async_op=True)
+        # all-gather 수행
+        all_gather_handle = dist.all_gather_coalesced(
+            output_tensors,
+            input_tensors,
+            group=self.penguin_comm_groups.param_shard_group,
+            async_op=True
+        )
 
+        # 결과 텐서 업데이트
         for idx, param in enumerate(params):
             param.data = output_tensors[idx].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
 
-        return Penguin_AllGatherCoalescedHandle(allgather_handle=all_gather_handle,
-                                             params=params,
-                                             partitions=[],
-                                             world_size=param_shard_size)
+        return Penguin_AllGatherCoalescedHandle(
+            allgather_handle=all_gather_handle,
+            params=params,
+            partitions=[],
+            world_size=self.shard_size
+        )
 
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
         """"""
