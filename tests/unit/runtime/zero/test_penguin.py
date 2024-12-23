@@ -12,6 +12,9 @@ from deepspeed.runtime.zero.partition_parameters import PartitionedParamStatus
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 import logging
 import sys
+from deepspeed.utils import logger
+
+logger = logging.getLogger(__name__)
 
 def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.float):
     batch_size = 4
@@ -39,75 +42,20 @@ class TestPenguinInterNodeOffload(DistributedTest):
         pass
         
     def test(self):
-        # GPU 체크를 우회
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend='nccl',
-                init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}',
-                world_size=int(os.environ['WORLD_SIZE']),
-                rank=int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
-            )
-            
-        n_nodes = int(os.environ.get('NNODES', '1'))
-        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
+        # DeepSpeed 분산 환경 초기화
+        deepspeed.init_distributed("nccl")
+        
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
         node_rank = int(os.environ.get('NODE_RANK', '0'))
-        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         
-        # 환경 변수로 world size 확인
-        world_size = int(os.environ.get('WORLD_SIZE', n_nodes * gpus_per_node))
-        
-        print(f"Process info - Node: {node_rank}, Local rank: {local_rank}, World size: {world_size}")
-        sys.stdout.flush()
-
-        # 분산 환경 정보 출력
-        if node_rank == 0:
-            print(f"\nDistributed setup:")
-            print(f"Number of nodes: {n_nodes}")
-            print(f"GPUs per node: {gpus_per_node}")
-            print(f"World size: {world_size}")
-            print(f"Backend: {dist.get_backend()}")
-            sys.stdout.flush()
-        
-        dist.barrier()  # 모든 프로세스가 여기까지 도달할 때까지 대기
-        
-        # 로깅 설정 추가
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - Node[%(node_rank)s] Rank[%(rank)s]: %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        logger = logging.getLogger(__name__)
-        
-        if get_accelerator().device_name() == "cpu":
-            pytest.skip("CPU accelerator does not support this test yet")
-            
-        n_nodes = int(os.environ.get('NNODES', '1'))
-        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
-        node_rank = int(os.environ.get('NODE_RANK', '0'))
-        rank = dist.get_rank()
-        
-        # logger에 node_rank와 rank 정보 추가
-        logger = logging.LoggerAdapter(logger, {
-            'node_rank': node_rank,
-            'rank': rank
-        })
-        
-        logger.info(f"Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
-        
-        # world_size 계산 
-        n_nodes = int(os.environ.get('NNODES', '1'))
-        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
-        world_size = n_nodes * gpus_per_node
-        
-        # batch size 계산 - self.world_size 사용
-        micro_batch = 4  # micro batch size per GPU
-        grad_acc = 1     # gradient accumulation steps
-        train_batch = micro_batch * grad_acc * self.world_size  # 4 * 1 * 16 = 64
+        # batch size 계산
+        batch_size_per_gpu = 4  # micro batch size per GPU
+        train_batch_size = world_size * batch_size_per_gpu
         
         config_dict = {
-            "train_batch_size": train_batch,
-            "gradient_accumulation_steps": grad_acc,
-            "train_micro_batch_size_per_gpu": micro_batch,
+            "train_batch_size": train_batch_size,
+            "train_micro_batch_size_per_gpu": batch_size_per_gpu,
             "steps_per_print": 1,
             "optimizer": {
                 "type": "Adam",
@@ -118,63 +66,27 @@ class TestPenguinInterNodeOffload(DistributedTest):
             "zero_optimization": {
                 "stage": 3,
                 "penguin": {
-                    "shard_size": gpus_per_node,
+                    "shard_size": 8,  # GPUs per node
                     "hierarchial_params_gather": True
-                }
-            },
-            "mesh_config": {  # mesh_device 설정 추가
-                "mesh_shape": [self.world_size],
-                "placements": ["data_parallel"],
-                "mesh_device": "cuda"
+                },
+                "allgather_bucket_size": 1e3,
+                "reduce_bucket_size": 1e3,
+                "stage3_prefetch_bucket_size": 1e3
             }
         }
         
         hidden_dim = 10
-        logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Initializing model with hidden_dim={hidden_dim}")
-
-        class SimpleModel(torch.nn.Module):
-            def __init__(self, hidden_dim):
-                super().__init__()
-                self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
-                self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
-                self.cross_entropy = torch.nn.CrossEntropyLoss()
-                logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Model parameters:")
-                for name, param in self.named_parameters():
-                    logger.info(f"  - {name}: {param.shape}, device={param.device}")
-
-            def forward(self, x, y):
-                logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Forward pass:")
-                logger.info(f"  Input x: shape={x.shape}, device={x.device}")
-                hidden = self.linear1(x)
-                logger.info(f"  After linear1: shape={hidden.shape}, device={hidden.device}")
-                output = self.linear2(hidden)
-                logger.info(f"  After linear2: shape={output.shape}, device={output.device}")
-                loss = self.cross_entropy(output, y)
-                logger.info(f"  Loss: {loss.item()}, device={loss.device}")
-                return loss
-
-        # Penguin_Init 전에 분산 환경 확인
-        if not dist.is_initialized():
-            dist.init_process_group(
-                backend='nccl',
-                init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}',
-                world_size=self.world_size,
-                rank=int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
-            )
+        logger.info(f"[Rank {rank}] Initializing model with hidden_dim={hidden_dim}")
         
         with deepspeed.zero.Penguin_Init(config_dict_or_path=config_dict):
             model = SimpleModel(hidden_dim)
-            logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Model initialized with Penguin")
-            for name, param in model.named_parameters():
-                logger.info(f"  - {name}: status={param.ds_status}, device={param.device}")
-
+            
         model, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
             config=config_dict
         )
-        logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] DeepSpeed initialized")
-
+        
         # CPU 버퍼 초기화 확인
         for name, param in model.named_parameters():
             if not hasattr(param, 'penguin_cpu_buffer'):
@@ -231,6 +143,19 @@ def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True
     # 전체 world size 확인
     world_size = ndevices_per_node * n_nodes
     assert dist.get_world_size() == world_size, "Mismatch in world size"
+
+class SimpleModel(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.cross_entropy = torch.nn.CrossEntropyLoss()
+
+    def forward(self, x, y):
+        hidden = self.linear1(x)
+        output = self.linear2(hidden)
+        loss = self.cross_entropy(output, y)
+        return loss
 
 def main():
     # DeepSpeed launcher가 제공하는 local_rank 사용
