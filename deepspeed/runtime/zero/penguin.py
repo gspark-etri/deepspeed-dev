@@ -26,6 +26,8 @@ from deepspeed.utils import instrument_w_nvtx, log_dist, logger
 from deepspeed.accelerator import get_accelerator
 from torch import Tensor
 from torch.nn import Parameter
+import json
+import os
 
 
 def has_hierarchical_all_gather_groups(comm_groups: Penguin_CommGroups):
