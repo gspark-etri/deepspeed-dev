@@ -2,13 +2,16 @@ import os
 import pytest
 import torch
 import deepspeed
-from deepspeed.runtime.zero.penguin import Penguin_Init
+from deepspeed.runtime.zero.penguin import Penguin_Init, PenguinParameter
 from unit.common import DistributedTest
 from deepspeed.accelerator import get_accelerator
 import torch.distributed as dist
 import tempfile
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
-from deepspeed.runtime.zero.partition_parameters import PartitionedParamStatus
+from deepspeed.runtime.zero.partition_parameters import (
+    ZeroParamStatus,
+    PartitionedParamStatus
+)
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 import logging
 import sys
@@ -140,6 +143,13 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 except Exception as e:
                     logger.error(f"  - {name}: Failed to access - {str(e)}")
 
+        # 파라미터가 PenguinParameter로 변환되었는지 확인
+        for name, param in model.named_parameters():
+            assert isinstance(param, PenguinParameter), f"Parameter {name} is not PenguinParameter"
+            assert hasattr(param, 'ds_tensor'), f"Parameter {name} missing ds_tensor"
+            assert hasattr(param, 'ds_numel'), f"Parameter {name} missing ds_numel"
+            assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {name} missing penguin_cpu_buffer"
+
 def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True, mpu=None):
     ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
     n_nodes = int(os.environ.get("NNODES", "1"))
@@ -151,6 +161,10 @@ def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True
 class SimpleModel(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
+        # 파라미터 초기화 전에 ds_id와 ds_status 설정
+        self.ds_id = 0
+        self.ds_status = ZeroParamStatus.AVAILABLE
+        
         self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
         self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
         self.cross_entropy = torch.nn.CrossEntropyLoss()

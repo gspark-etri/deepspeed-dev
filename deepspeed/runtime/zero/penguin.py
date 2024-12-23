@@ -68,6 +68,16 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         self.complete = True
 
 
+class PenguinParameter(Parameter):
+    def partition(self):
+        if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+            return
+        with torch.no_grad():
+            self.penguin_cpu_buffer.copy_(self.data.view(-1))
+            self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
+            self.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
+
 class Penguin_Init(Init):
 
     def __init__(self,
@@ -204,22 +214,15 @@ class Penguin_Init(Init):
                          config_dict_or_path, config, enabled, dtype, mpu)
 
     def _convert_to_deepspeed_param(self, param):
-        # ds_tensor 초기화 확인
-        if not hasattr(param, 'ds_tensor') or param.ds_tensor is None:
-            # ZeroParamStatus.NOT_AVAILABLE로 초기화
+        if not hasattr(param, 'ds_tensor'):
             param.ds_tensor = ZeroParamStatus.NOT_AVAILABLE
-            param.ds_numel = param.data.numel()  # numel 별도 저장
-        
-        # penguin_cpu_buffer 생성
-        param.penguin_cpu_buffer = torch.empty(
-            param.ds_numel,  # ds_tensor.ds_numel 대신 ds_numel 사용
-            dtype=param.dtype,
-            device='cpu'
-        )
-        
-        # 원본 데이터를 CPU 버퍼로 복사
-        with torch.no_grad():
-            param.penguin_cpu_buffer.copy_(param.data.view(-1))
+            param.ds_numel = param.data.numel()
+            param.__class__ = PenguinParameter  # 클래스 변환
+            param.penguin_cpu_buffer = torch.empty(
+                param.ds_numel,
+                dtype=param.dtype,
+                device='cpu'
+            )
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
