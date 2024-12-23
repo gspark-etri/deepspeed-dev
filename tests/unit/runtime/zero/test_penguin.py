@@ -96,7 +96,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
         logger.info(f"Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
         
         config_dict = {
-            "train_batch_size": 32,
+            "train_batch_size": 64,
             "gradient_accumulation_steps": 1,
             "train_micro_batch_size_per_gpu": 4,
             "steps_per_print": 1,
@@ -113,6 +113,10 @@ class TestPenguinInterNodeOffload(DistributedTest):
                     "hierarchial_params_gather": True
                 }
             },
+            "distributed": {
+                "world_size": world_size,
+                "distributed_backend": "nccl"
+            }
         }
         
         hidden_dim = 10
@@ -216,7 +220,17 @@ def main():
     # GPU 설정
     torch.cuda.set_device(local_rank)
     
-    # 분산 환경 초기화는 DeepSpeed launcher가 처리
+    # 분산 환경 초기화가 필요한 경우
+    if not dist.is_initialized():
+        world_size = int(os.environ.get('WORLD_SIZE', '16'))
+        rank = int(os.environ.get('RANK', str(local_rank)))
+        
+        dist.init_process_group(
+            backend='nccl',
+            init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{os.environ["MASTER_PORT"]}',
+            world_size=world_size,
+            rank=rank
+        )
     
     # 테스트 인스턴스 생성 및 실행
     test = TestPenguinInterNodeOffload()
