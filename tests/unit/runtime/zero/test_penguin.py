@@ -24,12 +24,16 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
 class TestPenguinInterNodeOffload(DistributedTest):
     @property
     def world_size(self):
-        return 16  # 2 nodes x 8 GPUs
+        # 실제 분산 환경의 world_size를 반환
+        if dist.is_initialized():
+            return dist.get_world_size()
+        n_nodes = int(os.environ.get('NNODES', '1'))
+        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
+        return n_nodes * gpus_per_node
         
     @property 
     def gpu_count(self):
-        # 실제 사용 가능한 GPU 수를 반환
-        return get_accelerator().device_count()
+        return self.world_size  # world_size와 동일하게 설정
         
     def setup_method(self, method):
         # 분산 환경이 이미 설정되어 있으므로 skip
@@ -96,7 +100,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
         logger.info(f"Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
         
         config_dict = {
-            "train_batch_size": 16,
+            "train_batch_size": 64,
             "gradient_accumulation_steps": 1,
             "train_micro_batch_size_per_gpu": 4,
             "steps_per_print": 1,
@@ -112,10 +116,6 @@ class TestPenguinInterNodeOffload(DistributedTest):
                     "shard_size": gpus_per_node,
                     "hierarchial_params_gather": True
                 }
-            },
-            "distributed": {
-                "world_size": world_size,
-                "distributed_backend": "nccl"
             }
         }
         
