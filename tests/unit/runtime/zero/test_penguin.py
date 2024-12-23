@@ -99,10 +99,20 @@ class TestPenguinInterNodeOffload(DistributedTest):
         
         logger.info(f"Starting test with {n_nodes} nodes, {gpus_per_node} GPUs per node")
         
+        # world_size 계산 
+        n_nodes = int(os.environ.get('NNODES', '1'))
+        gpus_per_node = int(os.environ.get('NDEV_PER_NODE', '8'))
+        world_size = n_nodes * gpus_per_node
+        
+        # batch size 계산
+        micro_batch = 4  # micro batch size per GPU
+        grad_acc = 1     # gradient accumulation steps
+        train_batch = micro_batch * grad_acc * world_size  # 4 * 1 * 16 = 64
+        
         config_dict = {
-            "train_batch_size": 64,
-            "gradient_accumulation_steps": 1,
-            "train_micro_batch_size_per_gpu": 4,
+            "train_batch_size": train_batch,  # 자동 계산
+            "gradient_accumulation_steps": grad_acc,
+            "train_micro_batch_size_per_gpu": micro_batch,
             "steps_per_print": 1,
             "optimizer": {
                 "type": "Adam",
@@ -116,6 +126,10 @@ class TestPenguinInterNodeOffload(DistributedTest):
                     "shard_size": gpus_per_node,
                     "hierarchial_params_gather": True
                 }
+            },
+            "distributed": {
+                "world_size": world_size,  # world_size 명시
+                "distributed_backend": "nccl"
             }
         }
         
