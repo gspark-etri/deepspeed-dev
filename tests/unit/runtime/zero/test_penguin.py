@@ -161,10 +161,6 @@ def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True
 class SimpleModel(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        # 파라미터 초기화 전에 ds_id와 ds_status 설정
-        self.ds_id = 0
-        self.ds_status = ZeroParamStatus.AVAILABLE
-        
         self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
         self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
         self.cross_entropy = torch.nn.CrossEntropyLoss()

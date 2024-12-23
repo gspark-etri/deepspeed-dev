@@ -69,6 +69,15 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
 
 
 class PenguinParameter(Parameter):
+    def __init__(self, data=None, requires_grad=True):
+        super().__init__(data, requires_grad=requires_grad)
+        # 필요한 속성들 초기화
+        self.ds_id = None
+        self.ds_status = ZeroParamStatus.AVAILABLE
+        self.ds_tensor = None
+        self.ds_numel = None if data is None else data.numel()
+        self.penguin_cpu_buffer = None
+
     def partition(self):
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
             return
