@@ -204,14 +204,20 @@ class Penguin_Init(Init):
                          config_dict_or_path, config, enabled, dtype, mpu)
 
     def _convert_to_deepspeed_param(self, param):
-        super()._convert_to_deepspeed_param(param)
-        param.comm = self.penguin_comm_groups
+        # ds_tensor 초기화 확인
+        if not hasattr(param, 'ds_tensor') or param.ds_tensor is None:
+            param.ds_tensor = DeepSpeedZeroParamStatus(param.data.numel())
         
-        # 미리 penguin용 CPU 버퍼만 초기화
-        param.penguin_cpu_buffer = torch.empty(param.ds_tensor.ds_numel,
-                                           dtype=param.dtype,
-                                           device='cpu',
-                                           pin_memory=True)
+        # penguin_cpu_buffer 생성
+        param.penguin_cpu_buffer = torch.empty(
+            param.ds_tensor.ds_numel,
+            dtype=param.dtype,
+            device='cpu'
+        )
+        
+        # 원본 데이터를 CPU 버퍼로 복사
+        with torch.no_grad():
+            param.penguin_cpu_buffer.copy_(param.data.view(-1))
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
