@@ -19,8 +19,7 @@ from deepspeed.runtime.zero.partition_parameters import (
     Init, 
     AllGatherCoalescedHandle, 
     ZeroParamStatus,
-    PartitionedParamStatus,
-    DeepSpeedZeroParamStatus
+    PartitionedParamStatus
 )
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 from deepspeed.utils import instrument_w_nvtx, log_dist, logger
@@ -207,11 +206,13 @@ class Penguin_Init(Init):
     def _convert_to_deepspeed_param(self, param):
         # ds_tensor 초기화 확인
         if not hasattr(param, 'ds_tensor') or param.ds_tensor is None:
-            param.ds_tensor = ZeroParamStatus(param.data.numel())
+            # ZeroParamStatus.NOT_AVAILABLE로 초기화
+            param.ds_tensor = ZeroParamStatus.NOT_AVAILABLE
+            param.ds_numel = param.data.numel()  # numel 별도 저장
         
         # penguin_cpu_buffer 생성
         param.penguin_cpu_buffer = torch.empty(
-            param.ds_tensor.ds_numel,
+            param.ds_numel,  # ds_tensor.ds_numel 대신 ds_numel 사용
             dtype=param.dtype,
             device='cpu'
         )
