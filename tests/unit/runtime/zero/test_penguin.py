@@ -70,7 +70,7 @@ class TestPenguinInterNodeOffload(DistributedTest):
             "zero_optimization": {
                 "stage": 3,
                 "penguin": {
-                    "shard_size": int(os.environ['NDEV_PER_NODE']),  # 환경변수에서 가져오기
+                    "shard_size": 16,  # 전체 world_size로 설정
                     "hierarchial_params_gather": True
                 },
                 "allgather_bucket_size": 1e3,

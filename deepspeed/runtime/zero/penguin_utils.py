@@ -99,7 +99,18 @@ def create_penguin_comm_groups(
     """
     # env var for debugging purpose
     ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
-    _log_rank0(f'creating Penguin communication groups with per node device size {ndevices_per_node}')
+    n_nodes = int(os.environ.get("NNODES", "1"))
+    
+    # 디버깅을 위한 로그 추가
+    logger.info(f"NNODES={n_nodes}, NDEV_PER_NODE={ndevices_per_node}")
+    logger.info(f"shard_size={shard_size}, world_size={dist.get_world_size()}")
+    
+    # n_span_nodes 계산 수정
+    n_span_nodes = (shard_size + ndevices_per_node - 1) // ndevices_per_node
+    logger.info(f"n_span_nodes calculation: {n_span_nodes} = ({shard_size} + {ndevices_per_node} - 1) // {ndevices_per_node}")
+    
+    assert n_span_nodes > 1, "sharding spans on single node, no need for hierarchy allgather"
+
     groups = Penguin_CommGroups()
 
     if mpu is not None:
