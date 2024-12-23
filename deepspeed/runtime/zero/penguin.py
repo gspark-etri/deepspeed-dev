@@ -71,20 +71,6 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
 class PenguinParameter(Parameter):
     """DeepSpeed Penguin Parameter class for parameter partitioning"""
     
-    def __init__(self, data=None, requires_grad=True):
-        super().__init__(data, requires_grad=requires_grad)
-        # DeepSpeed 기본 속성들
-        self.ds_id = None
-        self.ds_status = ZeroParamStatus.AVAILABLE
-        self.ds_tensor = None
-        self.ds_shape = None if data is None else data.shape
-        self.ds_numel = None if data is None else data.numel()
-        self.ds_param_type = None
-        
-        # Penguin 전용 속성
-        self.penguin_cpu_buffer = None
-        self.ds_process_group = None
-
     def partition(self):
         """Partition the parameter to CPU buffer"""
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
@@ -235,15 +221,18 @@ class Penguin_Init(Init):
                          config_dict_or_path, config, enabled, dtype, mpu)
 
     def _convert_to_deepspeed_param(self, param):
-        if not hasattr(param, 'ds_tensor'):
-            param.ds_tensor = ZeroParamStatus.NOT_AVAILABLE
-            param.ds_numel = param.data.numel()
-            param.__class__ = PenguinParameter  # 클래스 변환
-            param.penguin_cpu_buffer = torch.empty(
-                param.ds_numel,
-                dtype=param.dtype,
-                device='cpu'
-            )
+        # 먼저 부모 클래스의 변환을 수행하여 기본 속성들 초기화
+        super()._convert_to_deepspeed_param(param)
+        
+        # 그 다음 penguin 전용 속성 추가
+        param.penguin_cpu_buffer = torch.empty(
+            param.ds_numel,
+            dtype=param.dtype,
+            device='cpu'
+        )
+        
+        # 통신 그룹 설정
+        param.comm = self.penguin_comm_groups
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
