@@ -1543,7 +1543,8 @@ class DeepSpeedEngine(Module):
         zero_stage = self.zero_optimization_stage()
 
         if zero_stage == 3:
-            if 'penguin' in self.zero_optimization():
+            # config에서 직접 penguin 설정 확인
+            if 'penguin' in self.config.get('zero_optimization', {}):
                 # Use Penguin optimizer
                 log_dist('Creating Penguin ZeRO stage 3 optimizer', ranks=[0])
                 optimizer = Penguin_Optimizer(
@@ -2621,7 +2622,6 @@ class DeepSpeedEngine(Module):
                 value = torch.cat([value, value.new_empty(fill_size, value.size()[1])])
             tensor_list = [
                 value.new_empty(max_size, value.size()[1]) for _ in range(dist.get_world_size(group=dp_group))
-            ]
 
         dist.all_gather(tensor_list, value, group=dp_group)
         tensors = []
