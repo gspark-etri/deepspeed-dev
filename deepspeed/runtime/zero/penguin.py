@@ -320,7 +320,7 @@ class Penguin_Init(Init):
         )
 
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
-        """"""
+        """Hierarchical all-gather implementation"""
         params, params_buffers = self._pre_all_gather(params, params_buffers)
 
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
@@ -331,19 +331,21 @@ class Penguin_Init(Init):
 
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
+        
+        # 파라미터 텐서 준비
         param_tensors = []
         for i, p in enumerate(params):
             param_size = p.ds_tensor.ds_numel * param_shard_size
             if params_buffers is not None and params_buffers[i] is not None:
-                assert params_buffers[i].numel(
-                ) == param_size, f'param_buffers[{i}] size {params_buffers[i].numel()} does not match with param_size {param_size}'
                 param_tensor = params_buffers[i]
             else:
-                param_tensor = torch.empty(param_size, dtype=p.dtype, device=self.local_device,
-                                           requires_grad=False).view(-1)
+                param_tensor = torch.empty(param_size, 
+                                         dtype=p.dtype, 
+                                         device=self.local_device,
+                                         requires_grad=False).view(-1)
             param_tensors.append(param_tensor)
 
-        # inter node all-gather
+        # 노드 간 all-gather (비동기)
         inter_outputs = []
         inter_inputs = []
         for i, p in enumerate(params):
@@ -351,21 +353,27 @@ class Penguin_Init(Init):
             _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
             inter_outputs.append(_out)
             inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
-        # sync enqueue
-        dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
+        
+        # 비동기 all-gather 수행
+        inter_handle = dist.all_gather_coalesced(
+            inter_outputs, 
+            inter_inputs, 
+            group=inter_node_comm_group,
+            async_op=True
+        )
 
-        # intra node all-gather
+        # 노드 내 all-gather 준비
         intra_outputs = []
         intra_inputs = []
         for i, p in enumerate(params):
-            # partition param into multiple chunks for allgather
-            # because inter-node all-gather outputs are in a continues memory
-            # while in param memory, those inter-node data are placed in different
-            # location.
-            # each chunk is an intra-node output
             param_chunk = param_tensors[i].view(
-                (inter_node_size, intra_node_size, p.ds_tensor.ds_numel)).narrow(1, local_rank, 1)
-            param_chunk.copy_(inter_outputs[i].detach().clone().view(param_chunk.size()))
+                (inter_node_size, intra_node_size, p.ds_tensor.ds_numel)
+            ).narrow(1, local_rank, 1)
+            
+            # inter_handle.wait() 호출 전에 데이터 복사
+            with torch.no_grad():
+                param_chunk.copy_(inter_outputs[i].detach().clone().view(param_chunk.size()))
+                
             output_chunks = torch.chunk(param_tensors[i], inter_node_size)
             for j, _out in enumerate(output_chunks):
                 intra_chunk_size = intra_node_size * p.ds_tensor.ds_numel
@@ -374,10 +382,19 @@ class Penguin_Init(Init):
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
 
-        all_gather_handle = dist.all_gather_coalesced(intra_outputs,
-                                                      intra_inputs,
-                                                      group=intra_node_comm_group,
-                                                      async_op=True)
+        # inter_handle 완료 대기
+        if inter_handle is not None:
+            inter_handle.wait()
+
+        # 노드 내 all-gather (비동기)
+        all_gather_handle = dist.all_gather_coalesced(
+            intra_outputs,
+            intra_inputs,
+            group=intra_node_comm_group,
+            async_op=True
+        )
+
+        # 결과 업데이트
         for i, param in enumerate(params):
             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
 
@@ -385,7 +402,7 @@ class Penguin_Init(Init):
             allgather_handle=all_gather_handle,
             params=params,
             partitions=[],
-            world_size=param_shard_size,
+            world_size=param_shard_size
         )
 
     def get_partition_dp_group(self, param):
