@@ -138,9 +138,6 @@ class Penguin_Init(Init):
             shard_size=self.shard_size,
             hierarchial_params_gather=self.hierarchial_params_gather
         )
-        
-        # PartitionedParameterCoordinator에 penguin_comm_groups 전달
-        self.param_coordinator = PartitionedParameterCoordinator(penguin_comm_groups=self.penguin_comm_groups)
 
         # 부모 클래스 초기화
         super().__init__(module=module,
