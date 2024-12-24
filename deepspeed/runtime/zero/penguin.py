@@ -241,14 +241,11 @@ class Penguin_Init(Init):
         param.all_gather_coalesced = _param_all_gather_coalesced
 
     def _pre_all_gather(self, params, params_buffers=None):
-        # fetches from nvme if the partition is not available and in nvme
-        self._ensure_availability_of_partitioned_params(params)
-
         # 모든 비동기 작업이 완료되었는지 확인
         torch.cuda.synchronize()
 
         for param in params:
-            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE and hasattr(param, 'penguin_cpu_buffer') and param.comm.param_shard_rank != dist.get_rank(group=param.comm.param_inter_node_shard_group):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
                     if hasattr(param, 'penguin_cpu_buffer'):
@@ -257,7 +254,7 @@ class Penguin_Init(Init):
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
                 
-                param.ds_status = ZeroParamStatus.INFLIGHT
+                    param.ds_status = ZeroParamStatus.INFLIGHT
 
         # ensure that each rank has params in same order. the allgather
         # is done by flattening the parameter list into a single tensor that
@@ -552,6 +549,7 @@ def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> Peng
     if comm.param_shard_rank != inter_rank:
         # GPU에서 CPU로 비동기 복사
         param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1).to(param.penguin_cpu_buffer.device), non_blocking=True)
+        logger.info(f"Parameter {param.ds_id} copied from GPU to CPU buffer.")
         param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
         param.ds_tensor.final_location = OffloadDeviceEnum.cpu
     
