@@ -98,9 +98,9 @@ class PenguinParameter(Parameter):
         hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
         
         if dist.has_coalescing_manager() and hierarchical_all_gather:
-            return self.ds_process_group._hierarchical_all_gather_params(params)
+            return self.ds_process_group._hierarchical_all_gather_params(params, forward=forward, **kwargs)
         elif dist.has_coalescing_manager():
-            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params)
+            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params, forward=forward, **kwargs)
         else:
             raise NotImplementedError("Non-coalescing manager all-gather not supported")
 
