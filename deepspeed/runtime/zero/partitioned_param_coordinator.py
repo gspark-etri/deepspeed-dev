@@ -590,7 +590,8 @@ class PartitionedParameterCoordinator:
 
         # 전체 노드 수와 각 노드당 GPU 수를 가져옵니다.
         world_size = dist.get_world_size()
-        gpus_per_node = self.gpus_per_node  # 설정에서 받아온 각 노드당 GPU 수
+        # 각 노드당 GPU 수를 동적으로 계산합니다.
+        gpus_per_node = world_size // dist.get_world_size(group=dist.new_group())
 
         # 현재 노드와 GPU 인덱스를 계산합니다.
         current_node = current_rank // gpus_per_node
