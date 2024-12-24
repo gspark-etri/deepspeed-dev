@@ -602,7 +602,7 @@ class PartitionedParameterCoordinator:
         mapped_gpus = [(current_gpu_index + i * gpus_per_node) % world_size for i in range(1, world_size // gpus_per_node)]
 
         # 파라미터의 소유 랭크를 가져옵니다.
-        param_rank = param.ds_tensor.owner_rank
+        param_rank = dist.get_global_rank(param.ds_process_group, 0)
 
         # 현재 랭크와 매핑된 랭크인지 확인합니다.
         return param_rank in mapped_gpus
