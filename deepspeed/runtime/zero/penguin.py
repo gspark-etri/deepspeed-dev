@@ -461,4 +461,13 @@ def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> Peng
     param.penguin_cpu_buffer = torch.zeros(buffer_size,
                                          dtype=param.dtype,
                                          device='cpu')
+    
+    # 초기화 시점에 CPU로 이동해야 하는지 확인
+    inter_rank = dist.get_rank(group=comm.param_inter_node_shard_group)
+    if comm.param_shard_rank != inter_rank:
+        # GPU에서 CPU로 비동기 복사
+        param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1), non_blocking=True)
+        param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+        param.ds_tensor.final_location = OffloadDeviceEnum.cpu
+    
     return param
