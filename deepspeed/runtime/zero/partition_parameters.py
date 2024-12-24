@@ -1479,12 +1479,29 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         swap_in_list = []
         swap_in_flight = []
         for param in params:
+            # NVMe에 있거나 CPU buffer에 있는 경우를 모두 처리
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
-                assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-                swap_in_list.append(param)
+                # NVMe case
+                if param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
+                    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+                    swap_in_list.append(param)
+                # CPU buffer case - no action needed as data is already accessible
+                elif param.ds_tensor.final_location == OffloadDeviceEnum.cpu:
+                    continue
+                else:
+                    raise RuntimeError(f"Parameter {param.ds_id} is not available and not in NVMe or CPU")
+                
             if param.ds_tensor.status == PartitionedParamStatus.INFLIGHT:
-                assert param.ds_tensor.final_location == OffloadDeviceEnum.nvme and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-                swap_in_flight.append(param)
+                # NVMe case
+                if param.ds_tensor.final_location == OffloadDeviceEnum.nvme:
+                    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+                    swap_in_flight.append(param)
+                # CPU buffer case - should not happen as CPU transfers are synchronous
+                elif param.ds_tensor.final_location == OffloadDeviceEnum.cpu:
+                    logger.warning(f"Parameter {param.ds_id} unexpectedly in INFLIGHT state for CPU location")
+                    continue
+
+        # Handle NVMe swapping if needed
         if len(swap_in_list) > 0:
             swap_in_list[0].nvme_swapper.swap_in(swap_in_list, async_op=False)
         elif len(swap_in_flight) > 0:
