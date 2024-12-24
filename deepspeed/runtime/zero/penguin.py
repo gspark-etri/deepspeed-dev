@@ -444,3 +444,21 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
         partition group we can call the load_state_dict logic from ZeRO-3.
         """
         super().load_state_dict(state_dict_list, load_optimizer_states, load_from_fp32_weights, checkpoint_folder)
+
+
+def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> PenguinParameter:
+    """Convert a parameter to PenguinParameter"""
+    # Create PenguinParameter
+    param.__class__ = PenguinParameter
+    param.comm = comm
+    
+    # CPU buffer 초기화 - 파라미터의 실제 크기 사용
+    if hasattr(param, 'ds_tensor'):
+        buffer_size = param.ds_tensor.numel()
+    else:
+        buffer_size = param.numel()
+        
+    param.penguin_cpu_buffer = torch.zeros(buffer_size,
+                                         dtype=param.dtype,
+                                         device='cpu')
+    return param
