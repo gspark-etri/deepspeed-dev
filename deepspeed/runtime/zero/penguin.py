@@ -85,18 +85,6 @@ class PenguinParameter(Parameter):
     def ds_summary(self):
         """Return a summary string of the parameter's DeepSpeed status"""
         return f"Data type: {self.dtype}, Shape: {self.ds_shape}, Status: {self.ds_status}"
-        
-    def all_gather_coalesced(self, params, forward=True, **kwargs):
-        """Coalesced all-gather operation for parameter groups"""
-        mics_comm_groups: Penguin_CommGroups = params[0].comm
-        hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
-        
-        if dist.has_coalescing_manager() and hierarchical_all_gather:
-            return self.ds_process_group._hierarchical_all_gather_params(params, forward=forward, **kwargs)
-        elif dist.has_coalescing_manager():
-            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params, forward=forward, **kwargs)
-        else:
-            raise NotImplementedError("Non-coalescing manager all-gather not supported")
 
 
 class Penguin_Init(Init):
@@ -179,6 +167,23 @@ class Penguin_Init(Init):
         # 통신 그룹 설정
         param.comm = self.penguin_comm_groups
         param.ds_process_group = self.dp_process_group
+
+        # 기존 all_gather_coalesced 메서드 저장
+        old_all_gather_coalesced = param.all_gather_coalesced
+
+        def _param_all_gather_coalesced(params, param_buffers=None, **kwargs):
+            """Penguin-specific all-gather operation"""
+            penguin_comm_groups: Penguin_CommGroups = params[0].comm
+            hierarchical_all_gather = has_hierarchical_all_gather_groups(penguin_comm_groups)
+            if dist.has_coalescing_manager() and hierarchical_all_gather:
+                return self._hierarchical_all_gather_params(params, param_buffers)
+            elif dist.has_coalescing_manager():
+                return self._flat_all_gather_with_coalescing_manager(params, param_buffers)
+            else:
+                return old_all_gather_coalesced(params, **kwargs)
+
+        # all_gather_coalesced 메서드 변경
+        param.all_gather_coalesced = _param_all_gather_coalesced
 
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
