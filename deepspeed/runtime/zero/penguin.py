@@ -78,15 +78,42 @@ class PenguinParameter(Parameter):
         super().__init__(*args, **kwargs)
         # 통신 그룹 초기화
         if not hasattr(self, 'ds_process_group') or self.ds_process_group is None:
-            # 모든 랭크를 포함하는 그룹 생성
             self.ds_process_group = dist.new_group(ranks=list(range(dist.get_world_size())))
+        if self.ds_process_group is None:
+            self.ds_process_group = dist.group.WORLD
+
+        # penguin_cpu_buffer 초기화
+        self._initialize_cpu_buffer()
+
+    def _initialize_cpu_buffer(self):
+        """Initialize or resize the CPU buffer for inter-mapped GPU parameters."""
+        # 현재 랭크에 매핑된 파라미터인지 확인
+        if self._is_mapped_to_current_rank():
+            # 매핑된 파라미터의 크기를 가져옵니다.
+            mapped_size = self.ds_numel if hasattr(self, 'ds_numel') else self.data.numel()
+            if not hasattr(self, 'penguin_cpu_buffer') or self.penguin_cpu_buffer.numel() != mapped_size:
+                self.penguin_cpu_buffer = torch.zeros(
+                    mapped_size,
+                    dtype=self.dtype,
+                    device='cpu'
+                )
+
+    def _is_mapped_to_current_rank(self) -> bool:
+        """Check if the parameter is mapped to the current rank."""
+        current_rank = dist.get_rank()
+        if hasattr(self, 'comm') and self.comm.param_shard_group is not None:
+            param_rank = dist.get_rank(group=self.comm.param_shard_group)
+            return current_rank == param_rank
+        return False
 
     def partition(self):
         """Partition the parameter to CPU buffer"""
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
             return
         with torch.no_grad():
-            self.penguin_cpu_buffer.copy_(self.data.view(-1))
+            if self._is_mapped_to_current_rank():
+                self._initialize_cpu_buffer()  # Ensure buffer size matches mapped parameter size
+                self.penguin_cpu_buffer.copy_(self.data.view(-1))
             self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
             self.ds_status = ZeroParamStatus.NOT_AVAILABLE
             
