@@ -76,6 +76,10 @@ class PenguinParameter(Parameter):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # 통신 그룹 초기화
+        if not hasattr(self, 'ds_process_group') or self.ds_process_group is None:
+            # 모든 랭크를 포함하는 그룹 생성
+            self.ds_process_group = dist.new_group(ranks=list(range(dist.get_world_size())))
 
     def partition(self):
         """Partition the parameter to CPU buffer"""
