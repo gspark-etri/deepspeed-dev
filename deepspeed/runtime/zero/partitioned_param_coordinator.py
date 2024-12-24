@@ -479,10 +479,13 @@ class PartitionedParameterCoordinator:
                     self.__profiler.start_event(event_name)
                     handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
 
-                    #gspark: if penguin is enabled, we need to add _move_other_inter_params_to_cpu
-                    if self.comm is not None:
-                        if forward:
-                            self.comm._move_other_inter_params_to_cpu(param_group)
+                    # Check if parameter has penguin CPU buffer and move to CPU if needed
+                    if forward and hasattr(params[0], 'penguin_cpu_buffer'):
+                        for param in params:
+                            # CPU로 비동기 복사
+                            param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                            param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+                            param.ds_tensor.final_location = OffloadDeviceEnum.cpu
 
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
