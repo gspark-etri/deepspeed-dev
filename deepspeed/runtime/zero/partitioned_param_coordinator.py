@@ -591,7 +591,6 @@ class PartitionedParameterCoordinator:
 
         # 전체 노드 수와 각 노드당 GPU 수를 가져옵니다.
         world_size = dist.get_world_size()
-        # 각 노드당 GPU 수를 동적으로 계산합니다.
         gpus_per_node = torch.cuda.device_count()
 
         # 현재 노드와 GPU 인덱스를 계산합니다.
@@ -602,6 +601,8 @@ class PartitionedParameterCoordinator:
         mapped_gpus = [(current_gpu_index + i * gpus_per_node) % world_size for i in range(1, world_size // gpus_per_node)]
 
         # 파라미터의 소유 랭크를 가져옵니다.
+        if param.ds_process_group is None:
+            raise RuntimeError("ds_process_group is not initialized for the parameter.")
         param_rank = dist.get_global_rank(param.ds_process_group, 0)
 
         # 현재 랭크와 매핑된 랭크인지 확인합니다.
