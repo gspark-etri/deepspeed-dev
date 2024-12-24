@@ -12,6 +12,7 @@ from typing import List
 import deepspeed
 import torch
 from deepspeed import comm as dist
+from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.zero.utils import is_zero_param
 from deepspeed.runtime.zero.penguin_utils import (Penguin_CommGroups, create_penguin_comm_groups, scale_tensors)
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
