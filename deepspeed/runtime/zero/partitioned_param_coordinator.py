@@ -452,9 +452,13 @@ class PartitionedParameterCoordinator:
     def __all_gather_params_(self, params: Set[Parameter], forward: bool, quantize: bool = False) -> None:
         """for each partitioned parameter, kick off an async allgather and store
         the work handle for the in flight parameters."""
-        #gspark: fix the function
         partitioned_params = []
         all_gather_numel = 0  # numel = num of elements
+        
+        # Backward pass에서 CPU buffer로부터 데이터 복원
+        if not forward and hasattr(params[0], 'comm'):
+            params[0].comm._get_inter_params_from_cpu(params)
+
         for param in params:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 partitioned_params.append(param)
@@ -501,10 +505,20 @@ class PartitionedParameterCoordinator:
 
     @compiler.disable
     @instrument_w_nvtx
-    def __release_param(self, param: Parameter) -> None:
+    def __release_param(self, param: Parameter, *args) -> None:
+        """Release a parameter
+        Args:
+            param (Parameter): parameter to release
+            forward (bool, optional): whether in forward pass. If not specified, won't move to CPU buffer.
+        """
         if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-release: {param.ds_summary()}")
+            
+            # Forward pass가 명시적으로 지정된 경우에만 CPU buffer로 이동
+            if len(args) > 0 and args[0] and hasattr(param, 'comm'):
+                param.comm._move_other_inter_params_to_cpu([param])
+            
             param.partition()
             self.__n_available_params -= param.ds_numel
 
