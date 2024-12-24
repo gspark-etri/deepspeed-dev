@@ -253,7 +253,7 @@ class Penguin_Init(Init):
                         logger.info(f"Parameter {param.ds_id} copied from CPU buffer to GPU.")
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
-                
+                    
                     param.ds_status = ZeroParamStatus.INFLIGHT
 
         # ensure that each rank has params in same order. the allgather
@@ -294,6 +294,8 @@ class Penguin_Init(Init):
         # 결과 텐서 업데이트
         for idx, param in enumerate(params):
             param.data = output_tensors[idx].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+            param.ds_status = ZeroParamStatus.AVAILABLE  # 상태를 AVAILABLE로 변경
+            logger.info(f"Parameter {param.ds_id} is now AVAILABLE on GPU.")
 
         # all-gather 핸들이 완료된 후 release 호출
         all_gather_handle.wait()
