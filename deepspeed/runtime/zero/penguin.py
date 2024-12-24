@@ -86,15 +86,15 @@ class PenguinParameter(Parameter):
         """Return a summary string of the parameter's DeepSpeed status"""
         return f"Data type: {self.dtype}, Shape: {self.ds_shape}, Status: {self.ds_status}"
         
-    def all_gather_coalesced(self, params, **kwargs):
+    def all_gather_coalesced(self, params, forward=True, **kwargs):
         """Coalesced all-gather operation for parameter groups"""
         mics_comm_groups: Penguin_CommGroups = params[0].comm
         hierarchical_all_gather = has_hierarchical_all_gather_groups(mics_comm_groups)
         
         if dist.has_coalescing_manager() and hierarchical_all_gather:
-            return self.ds_process_group._hierarchical_all_gather_params(params, **kwargs)
+            return self.ds_process_group._hierarchical_all_gather_params(params, forward=forward, **kwargs)
         elif dist.has_coalescing_manager():
-            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params, **kwargs)
+            return self.ds_process_group._flat_all_gather_with_coalescing_manager(params, forward=forward, **kwargs)
         else:
             raise NotImplementedError("Non-coalescing manager all-gather not supported")
 
