@@ -1543,39 +1543,19 @@ class DeepSpeedEngine(Module):
         zero_stage = self.zero_optimization_stage()
 
         if zero_stage == 3:
-            # config에서 직접 penguin 설정 확인
-            if 'penguin' in self.config.get('zero_optimization', {}):
+            if 'penguin' in self.zero_optimization_config():
                 # Use Penguin optimizer
-                log_dist('Creating Penguin ZeRO stage 3 optimizer', ranks=[0])
-                
-                # Zero3 설정 가져오기
-                zero_config = self.config.get('zero_optimization', {})
+                if kwargs.get('optimizer') is None:  # optimizer가 None이면 DummyOptim 사용
+                    optimizer = DummyOptim(list(self.module.parameters()))
+                else:
+                    optimizer = kwargs['optimizer']
+                    
                 optimizer = Penguin_Optimizer(
                     module=self.module,
-                    init_optimizer=kwargs.get('optimizer', None),
+                    init_optimizer=optimizer,  # 여기서 DummyOptim이 들어감
                     timers=self.timers if self.wall_clock_breakdown() else NoopTimer(),
                     ds_config=self.config,
-                    static_loss_scale=self.loss_scale(),
-                    dynamic_loss_scale=self.dynamic_loss_scale(),
-                    dynamic_loss_args=self.dynamic_loss_scale_args(),
-                    clip_grad=self.gradient_clipping(),
-                    contiguous_gradients=self.zero_contiguous_gradients(),
-                    reduce_bucket_size=self.zero_reduce_bucket_size(),
-                    prefetch_bucket_size=self.zero_prefetch_bucket_size(),
-                    max_reuse_distance=self.zero_max_reuse_distance(),
-                    max_live_parameters=self.zero_max_live_parameters(),
-                    param_persistence_threshold=self.zero_param_persistence_threshold(),
-                    model_persistence_threshold=self.zero_model_persistence_threshold(),
-                    dp_process_group=self.data_parallel_group,
-                    reduce_scatter=self.zero_reduce_scatter(),
-                    overlap_comm=self.zero_overlap_comm(),
-                    offload_optimizer_config=self.zero_offload_optimizer(),
-                    offload_param_config=self.zero_offload_param(),
-                    sub_group_size=self.zero_sub_group_size(),
-                    mpu=self.mpu,
-                    postscale_gradients=self.postscale_gradients(),
-                    gradient_predivide_factor=self.gradient_predivide_factor(),
-                    gradient_accumulation_steps=self.gradient_accumulation_steps()
+                    **self._get_zero_optimizer_config()
                 )
                 return optimizer
 
