@@ -480,9 +480,9 @@ class PartitionedParameterCoordinator:
                     handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
 
                     #gspark: if penguin is enabled, we need to add _move_other_inter_params_to_cpu
-                    if self.penguin_comm_groups is not None:
+                    if self.comm is not None:
                         if forward:
-                            self.penguin_comm_groups._move_other_inter_params_to_cpu(param_group)
+                            self.comm._move_other_inter_params_to_cpu(param_group)
 
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
