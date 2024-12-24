@@ -486,10 +486,12 @@ class PartitionedParameterCoordinator:
                     # Check if parameter has penguin CPU buffer and move to CPU if needed
                     if forward and hasattr(params[0], 'penguin_cpu_buffer'):
                         for param in params:
-                            # CPU로 비동기 복사
-                            param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
-                            param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
-                            param.ds_tensor.final_location = OffloadDeviceEnum.cpu
+                            # Check if the parameter is mapped to the current rank
+                            if self._is_mapped_to_current_rank(param):
+                                # CPU로 비동기 복사
+                                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                                param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+                                param.ds_tensor.final_location = OffloadDeviceEnum.cpu
 
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
@@ -581,3 +583,24 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
+
+    def _is_mapped_to_current_rank(self, param: Parameter) -> bool:
+        # 현재 랭크를 가져옵니다.
+        current_rank = dist.get_rank()
+
+        # 전체 노드 수와 각 노드당 GPU 수를 가져옵니다.
+        world_size = dist.get_world_size()
+        gpus_per_node = self.gpus_per_node  # 설정에서 받아온 각 노드당 GPU 수
+
+        # 현재 노드와 GPU 인덱스를 계산합니다.
+        current_node = current_rank // gpus_per_node
+        current_gpu_index = current_rank % gpus_per_node
+
+        # 매핑된 GPU 인덱스를 계산합니다.
+        mapped_gpus = [(current_gpu_index + i * gpus_per_node) % world_size for i in range(1, world_size // gpus_per_node)]
+
+        # 파라미터의 소유 랭크를 가져옵니다.
+        param_rank = param.ds_tensor.owner_rank
+
+        # 현재 랭크와 매핑된 랭크인지 확인합니다.
+        return param_rank in mapped_gpus

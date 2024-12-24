@@ -81,11 +81,11 @@ class Penguin_CommGroups:
                     # 안전을 위한 크기 체크
                     if param.ds_tensor.numel() != param.penguin_cpu_buffer.numel():
                         logger.warning(f"Tensor size mismatch for param {param.ds_id}. "
-                                     f"Resizing penguin_cpu_buffer from {param.penguin_cpu_buffer.numel()} "
-                                     f"to {param.ds_tensor.numel()}")
+                                       f"Resizing penguin_cpu_buffer from {param.penguin_cpu_buffer.numel()} "
+                                       f"to {param.ds_tensor.numel()}")
                         param.penguin_cpu_buffer = torch.zeros(param.ds_tensor.numel(),
-                                                             dtype=param.dtype,
-                                                             device='cpu')
+                                                               dtype=param.dtype,
+                                                               device='cpu')
                     
                     param.ds_tensor.data.view(-1).copy_(param.penguin_cpu_buffer, non_blocking=True)
                     param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
