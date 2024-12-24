@@ -1548,13 +1548,13 @@ class DeepSpeedEngine(Module):
             if 'penguin' in self.config.get('zero_optimization', {}):
                 # Use Penguin optimizer
                 if kwargs.get('optimizer') is None:
-                    optimizer = DummyOptim(list(self.module.parameters()))
+                    init_optimizer = DummyOptim(list(self.module.parameters()))
                 else:
-                    optimizer = kwargs['optimizer']
+                    init_optimizer = kwargs['optimizer']
                     
                 optimizer = Penguin_Optimizer(
                     module=self.module,
-                    init_optimizer=optimizer,
+                    init_optimizer=init_optimizer,
                     timers=self.timers if self.wall_clock_breakdown() else NoopTimer(),
                     ds_config=self.config,
                     static_loss_scale=self.loss_scale(),
