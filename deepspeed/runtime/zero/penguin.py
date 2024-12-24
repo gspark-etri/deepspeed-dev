@@ -374,7 +374,7 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
 
         log_dist("Init Penguin optimizer", ranks=[0])
         super().__init__(module=module, 
-                        optimizer=init_optimizer,
+                        init_optimizer=init_optimizer,
                         timers=timers,
                         ds_config=ds_config,
                         static_loss_scale=static_loss_scale,
