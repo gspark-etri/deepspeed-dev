@@ -74,6 +74,9 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
 class PenguinParameter(Parameter):
     """DeepSpeed Penguin Parameter class for parameter partitioning"""
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     def partition(self):
         """Partition the parameter to CPU buffer"""
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
