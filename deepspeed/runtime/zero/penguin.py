@@ -87,15 +87,14 @@ class PenguinParameter(Parameter):
 
     def _initialize_cpu_buffer(self):
         """Initialize or resize the CPU buffer for inter-mapped GPU parameters."""
-        # 현재 랭크에 매핑된 파라미터인지 확인
         if self._is_mapped_to_current_rank():
-            # 매핑된 파라미터의 크기를 가져옵니다.
             mapped_size = self.ds_numel if hasattr(self, 'ds_numel') else self.data.numel()
             if not hasattr(self, 'penguin_cpu_buffer') or self.penguin_cpu_buffer.numel() != mapped_size:
-                self.penguin_cpu_buffer = torch.zeros(
+                self.penguin_cpu_buffer = torch.empty(
                     mapped_size,
                     dtype=self.dtype,
-                    device='cpu'
+                    device='cpu',
+                    pin_memory=True  # Use pinned memory for better performance
                 )
 
     def _is_mapped_to_current_rank(self) -> bool:
@@ -112,8 +111,8 @@ class PenguinParameter(Parameter):
             return
         with torch.no_grad():
             if self._is_mapped_to_current_rank():
-                self._initialize_cpu_buffer()  # Ensure buffer size matches mapped parameter size
-                self.penguin_cpu_buffer.copy_(self.data.view(-1))
+                self._initialize_cpu_buffer()
+                self.penguin_cpu_buffer.copy_(self.data.view(-1), non_blocking=True)
             self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
             self.ds_status = ZeroParamStatus.NOT_AVAILABLE
             
@@ -187,6 +186,25 @@ class Penguin_Init(Init):
                         dtype=dtype,
                         mpu=mpu)
 
+        self.is_forward = False
+
+    def register_hooks(self, module):
+        # Forward hook
+        module.register_forward_pre_hook(self._start_forward)
+        module.register_forward_hook(self._end_forward)
+
+        # Backward hook
+        module.register_backward_hook(self._start_backward)
+
+    def _start_forward(self, module, input):
+        self.is_forward = True
+
+    def _end_forward(self, module, input, output):
+        self.is_forward = False
+
+    def _start_backward(self, module, grad_input, grad_output):
+        self.is_forward = False
+
     def _convert_to_deepspeed_param(self, param):
         # 먼저 부모 클래스의 변환을 수행하여 기본 속성들 초기화
         super()._convert_to_deepspeed_param(param)
@@ -223,13 +241,17 @@ class Penguin_Init(Init):
     def _pre_all_gather(self, params, params_buffers=None):
         # fetches from nvme if the partition is not available and in nvme
         self._ensure_availability_of_partitioned_params(params)
-        #gspark: fetchs from cpu
-        #self._get_partitioned_params_from_cpu(params)
 
         for param in params:
-            if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
-                raise RuntimeError(param.ds_summary())
-            param.ds_status = ZeroParamStatus.INFLIGHT
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                if self.is_forward:
+                    # CPU 버퍼에서 데이터를 가져옵니다.
+                    if hasattr(param, 'penguin_cpu_buffer'):
+                        param.data.copy_(param.penguin_cpu_buffer, non_blocking=True)
+                    else:
+                        raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
+                
+                param.ds_status = ZeroParamStatus.INFLIGHT
 
         # ensure that each rank has params in same order. the allgather
         # is done by flattening the parameter list into a single tensor that

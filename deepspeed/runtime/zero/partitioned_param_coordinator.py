@@ -484,16 +484,6 @@ class PartitionedParameterCoordinator:
                     self.__profiler.start_event(event_name)
                     handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
 
-                    # Check if parameter has penguin CPU buffer and move to CPU if needed
-                    if forward and hasattr(params[0], 'penguin_cpu_buffer'):
-                        for param in params:
-                            # Check if the parameter is mapped to the current rank
-                            if self._is_mapped_to_current_rank(param):
-                                # CPU로 비동기 복사
-                                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
-                                param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
-                                param.ds_tensor.final_location = OffloadDeviceEnum.cpu
-
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
                     assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
