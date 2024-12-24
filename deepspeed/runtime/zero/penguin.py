@@ -29,6 +29,7 @@ from torch.nn import Parameter
 import json
 import os
 from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator
+from .penguin_utils import create_penguin_comm_groups
 
 
 def has_hierarchical_all_gather_groups(comm_groups: Penguin_CommGroups):
@@ -144,7 +145,7 @@ class Penguin_Init(Init):
         self.model_persistence_threshold = zero_config.get('model_persistence_threshold', sys.maxsize)
         self.dp_process_group = data_parallel_group
 
-        # 통신 그룹 초기화
+        # 통신 그룹 초기화 - penguin_utils의 함수 사용
         self.penguin_comm_groups = create_penguin_comm_groups(
             shard_size=self.shard_size,
             hierarchial_params_gather=self.hierarchial_params_gather

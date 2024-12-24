@@ -352,3 +352,9 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
         return self
+
+    @model_validator(mode="after")
+    def penguin_config_check(self):
+        if self.penguin is not None:
+            assert self.stage == ZeroStageEnum.weights, "Penguin is only compatible with ZeRO Stage 3"
+        return self
