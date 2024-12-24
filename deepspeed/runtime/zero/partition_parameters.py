@@ -1479,7 +1479,6 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         swap_in_list = []
         swap_in_flight = []
         for param in params:
-            # NVMe에 있거나 CPU buffer에 있는 경우를 모두 처리
             if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
                 # NVMe case
                 if param.ds_tensor.final_location == OffloadDeviceEnum.nvme:

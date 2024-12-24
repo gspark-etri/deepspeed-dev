@@ -96,6 +96,7 @@ class PenguinParameter(Parameter):
                     device='cpu',
                     pin_memory=True  # Use pinned memory for better performance
                 )
+                logger.info(f"Initialized CPU buffer for parameter {self.ds_id} with size {mapped_size}.")
 
     def _is_mapped_to_current_rank(self) -> bool:
         """Check if the parameter is mapped to the current rank."""
@@ -251,7 +252,7 @@ class Penguin_Init(Init):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
                     if hasattr(param, 'penguin_cpu_buffer'):
-                        param.data.copy_(param.penguin_cpu_buffer, non_blocking=True)
+                        param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
                         logger.info(f"Parameter {param.ds_id} copied from CPU buffer to GPU.")
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
@@ -550,7 +551,7 @@ def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> Peng
     inter_rank = dist.get_rank(group=comm.param_inter_node_shard_group)
     if comm.param_shard_rank != inter_rank:
         # GPU에서 CPU로 비동기 복사
-        param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1), non_blocking=True)
+        param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1).to(param.penguin_cpu_buffer.device), non_blocking=True)
         param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
         param.ds_tensor.final_location = OffloadDeviceEnum.cpu
     
