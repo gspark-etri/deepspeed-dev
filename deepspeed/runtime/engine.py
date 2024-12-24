@@ -316,7 +316,7 @@ class DeepSpeedEngine(Module):
         if has_optimizer:
             self._configure_optimizer(optimizer, model_parameters)
             self._configure_lr_scheduler()
-            self._report_progress(0)
+            # self._report_progress(0)
         elif self.zero_optimization():
             # no optim selected but zero is enabled
             self.optimizer = self._configure_zero_optimizer(optimizer=None)
