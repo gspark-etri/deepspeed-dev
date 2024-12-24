@@ -589,21 +589,11 @@ class PartitionedParameterCoordinator:
         # 현재 랭크를 가져옵니다.
         current_rank = dist.get_rank()
 
-        # 전체 노드 수와 각 노드당 GPU 수를 가져옵니다.
-        world_size = dist.get_world_size()
-        gpus_per_node = torch.cuda.device_count()
+        # 파라미터의 통신 그룹을 사용하여 소유 랭크를 결정합니다.
+        if hasattr(param, 'comm') and param.comm.param_shard_group is not None:
+            param_rank = dist.get_rank(group=param.comm.param_shard_group)
+        else:
+            raise RuntimeError("Parameter does not have a valid communication group.")
 
-        # 현재 노드와 GPU 인덱스를 계산합니다.
-        current_node = current_rank // gpus_per_node
-        current_gpu_index = current_rank % gpus_per_node
-
-        # 매핑된 GPU 인덱스를 계산합니다.
-        mapped_gpus = [(current_gpu_index + i * gpus_per_node) % world_size for i in range(1, world_size // gpus_per_node)]
-
-        # 파라미터의 소유 랭크를 가져옵니다.
-        if param.ds_process_group is None:
-            raise RuntimeError("ds_process_group is not initialized for the parameter.")
-        param_rank = dist.get_global_rank(param.ds_process_group, 0)
-
-        # 현재 랭크와 매핑된 랭크인지 확인합니다.
-        return param_rank in mapped_gpus
+        # 현재 랭크와 파라미터의 소유 랭크가 일치하는지 확인합니다.
+        return current_rank == param_rank
