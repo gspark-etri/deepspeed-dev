@@ -55,7 +55,7 @@ class Penguin_CommGroups:
             inter_rank = dist.get_rank(group=self.param_inter_node_shard_group)
             
             # 현재 노드의 파라미터가 아닌 경우에만 CPU로 이동
-            if param.ds_param_rank != inter_rank:
+            if self.param_shard_rank != inter_rank:
                 # 필요한 속성들이 모두 있는지 확인
                 assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {param.ds_id} missing penguin_cpu_buffer"
                 
@@ -73,7 +73,7 @@ class Penguin_CommGroups:
             inter_rank = dist.get_rank(group=self.param_inter_node_shard_group)
             
             # 현재 노드의 파라미터가 아닌 경우에만 GPU로 복원
-            if param.ds_param_rank != inter_rank:
+            if self.param_shard_rank != inter_rank:
                 # 필요한 속성들이 모두 있는지 확인
                 assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {param.ds_id} missing penguin_cpu_buffer"
                 
