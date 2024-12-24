@@ -508,10 +508,6 @@ class PartitionedParameterCoordinator:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-release: {param.ds_summary()}")
             
-            # Forward pass가 명시적으로 지정된 경우에만 CPU buffer로 이동
-            if len(args) > 0 and args[0] and hasattr(param, 'comm'):
-                param.comm._move_other_inter_params_to_cpu([param])
-            
             param.partition()
             self.__n_available_params -= param.ds_numel
 

@@ -195,6 +195,7 @@ class Penguin_Init(Init):
 
         # Backward hook
         module.register_backward_hook(self._start_backward)
+    
 
     def _start_forward(self, module, input):
         self.is_forward = True
@@ -242,12 +243,16 @@ class Penguin_Init(Init):
         # fetches from nvme if the partition is not available and in nvme
         self._ensure_availability_of_partitioned_params(params)
 
+        # 모든 비동기 작업이 완료되었는지 확인
+        torch.cuda.synchronize()
+
         for param in params:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-                if self.is_forward:
+                if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
                     if hasattr(param, 'penguin_cpu_buffer'):
                         param.data.copy_(param.penguin_cpu_buffer, non_blocking=True)
+                        logger.info(f"Parameter {param.ds_id} copied from CPU buffer to GPU.")
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
                 
@@ -260,6 +265,7 @@ class Penguin_Init(Init):
         # silently get incorrect parameter values, and have very difficult
         # to debug correctness issues.
         params = sorted(params, key=lambda p: p.ds_id)
+        logger.info(f"All-gather operation started for parameters: {[p.ds_id for p in params]}")
         return params, params_buffers
 
     def _flat_all_gather_with_coalescing_manager(self, params, params_buffers=None):
@@ -290,6 +296,11 @@ class Penguin_Init(Init):
         # 결과 텐서 업데이트
         for idx, param in enumerate(params):
             param.data = output_tensors[idx].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+
+        # all-gather 핸들이 완료된 후 release 호출
+        all_gather_handle.wait()
+        if self.is_forward:
+            self._release_unused_parameters(params)
 
         return Penguin_AllGatherCoalescedHandle(
             allgather_handle=all_gather_handle,
@@ -501,6 +512,22 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
         partition group we can call the load_state_dict logic from ZeRO-3.
         """
         super().load_state_dict(state_dict_list, load_optimizer_states, load_from_fp32_weights, checkpoint_folder)
+
+    def _release_unused_parameters(self, params):
+        """Release unused parameters to free up memory."""
+        for param in params:
+            if param.ds_status == ZeroParamStatus.INFLIGHT:
+                # CPU로 파라미터를 옮깁니다.
+                if hasattr(param, 'penguin_cpu_buffer'):
+                    param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                    logger.info(f"Parameter {param.ds_id} moved to CPU memory.")
+                else:
+                    raise RuntimeError(f"Parameter {param.ds_id} does not have a CPU buffer.")
+
+                # GPU 메모리를 해제합니다.
+                param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
+                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+                logger.info(f"Parameter {param.ds_id} released from GPU memory.")
 
 
 def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> PenguinParameter:
