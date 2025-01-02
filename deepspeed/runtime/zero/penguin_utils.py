@@ -154,7 +154,9 @@ def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
             if global_rank in ranks:
                 groups.param_inter_node_shard_group = group
 
-    logger.info(f"groups: {groups}")
+    logger.info(f"groups.param_shard_group: {groups.param_shard_group}, groups.param_shard_rank: {groups.param_shard_rank}")
+    logger.info(f"groups.param_repli_group: {groups.param_repli_group}, groups.param_repli_rank: {groups.param_repli_rank}")
+    logger.info(f"groups.param_intra_node_group: {groups.param_intra_node_group}, groups.param_inter_node_shard_group: {groups.param_inter_node_shard_group}")
     return groups
 
 
