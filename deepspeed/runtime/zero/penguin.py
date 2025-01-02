@@ -87,6 +87,9 @@ class Penguin_Init(Init):
                  mpu=None):
         """Penguin initialization context"""
         
+        # is_forward 플래그 초기화
+        self.is_forward = True  # 기본값을 True로 설정
+        
         assert config_dict_or_path is not None, "Must provide configuration for Penguin Initialization"
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path, mpu)
         
@@ -131,7 +134,7 @@ class Penguin_Init(Init):
 
     def _convert_to_deepspeed_param(self, param):
         """Convert a regular parameter to a DeepSpeed parameter with Penguin features"""
-        # 부모 클래스의 변환 메서드 호출
+                # 부모 클래스의 변환 메서드 호출
         super()._convert_to_deepspeed_param(param)
 
         # 통신 그룹 설정
