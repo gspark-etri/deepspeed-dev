@@ -83,7 +83,8 @@ class PenguinParameter(Parameter):
             self.ds_process_group = dist.group.WORLD
 
         # penguin_cpu_buffer 초기화
-        self._initialize_cpu_buffer()
+        self.partition()
+        #self._initialize_cpu_buffer()
 
     def _initialize_cpu_buffer(self):
         """Initialize or resize the CPU buffer for inter-mapped GPU parameters."""
@@ -245,6 +246,7 @@ class Penguin_Init(Init):
         torch.cuda.synchronize()
 
         for param in params:
+            # 본인에게 해당하는 파라미터인지 확인 
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE and hasattr(param, 'penguin_cpu_buffer') and param.comm.param_shard_rank != dist.get_rank(group=param.comm.param_inter_node_shard_group):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
