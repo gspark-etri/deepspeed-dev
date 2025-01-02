@@ -201,6 +201,18 @@ class Penguin_Init(Init):
 
     def _start_backward(self, module, grad_input, grad_output):
         self.is_forward = False
+    
+    def _should_copy_param_to_gpu(self, param):
+        return (param.ds_status == ZeroParamStatus.NOT_AVAILABLE 
+                and hasattr(param, 'penguin_cpu_buffer')
+                and param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group)
+                and param.comm.param_shard_rank != dist.get_rank())
+
+    def _copy_param_from_cpu_to_gpu(self, param):
+        assert param.penguin_cpu_buffer is not None
+        param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
+        param.ds_status = ZeroParamStatus.INFLIGHT
+
 
     def _pre_all_gather(self, params, params_buffers=None):
         # 모든 비동기 작업이 완료되었는지 확인
@@ -212,17 +224,13 @@ class Penguin_Init(Init):
         for param in params:
             # 본인에게 해당하는 파라미터인지 확인 
             logger.info(f"param.comm.param_shard_rank: {param.comm.param_shard_rank}, dist.get_rank(group=param.comm.param_inter_node_shard_group): {dist.get_rank(group=param.comm.param_inter_node_shard_group)}")
-            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE and hasattr(param, 'penguin_cpu_buffer') and param.comm.param_shard_rank != dist.get_rank(group=param.comm.param_inter_node_shard_group):
-                if not self.is_forward:
-                    # CPU 버퍼에서 데이터를 가져옵니다.
-                    if hasattr(param, 'penguin_cpu_buffer'):
-                        # 비동기 복사 수행
-                        param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
-                        param.ds_status = ZeroParamStatus.INFLIGHT
-                        logger.info(f"Parameter {param.ds_id} copying from CPU buffer to GPU asynchronously.")
-                    else:
-                        raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
 
+            if not self.is_forward:
+                if self._should_copy_param_to_gpu(param):
+                    self._copy_param_from_cpu_to_gpu(param)
+                    logger.info(f"Parameter {param.ds_id} copying from CPU buffer to GPU asynchronously.")
+
+        
         # 모든 복사 작업이 완료된 후 이벤트 기록
         torch.cuda.current_stream().record_event(copy_event)
 
