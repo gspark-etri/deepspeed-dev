@@ -255,6 +255,7 @@ class Penguin_Init(Init):
 
         for param in params:
             # 본인에게 해당하는 파라미터인지 확인 
+            logger.info(f"param.comm.param_shard_rank: {param.comm.param_shard_rank}, dist.get_rank(group=param.comm.param_inter_node_shard_group): {dist.get_rank(group=param.comm.param_inter_node_shard_group)}")
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE and hasattr(param, 'penguin_cpu_buffer') and param.comm.param_shard_rank != dist.get_rank(group=param.comm.param_inter_node_shard_group):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
@@ -361,22 +362,22 @@ class Penguin_Init(Init):
             param_tensors.append(param_tensor)
 
         # 노드 간 all-gather
-        inter_outputs = []
-        inter_inputs = []
-        for i, p in enumerate(params):
-            inter_size = p.ds_tensor.ds_numel * inter_node_size
-            _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
-            inter_outputs.append(_out)
-            inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
+        #inter_outputs = []
+        #inter_inputs = []
+        #for i, p in enumerate(params):
+        #    inter_size = p.ds_tensor.ds_numel * inter_node_size
+        #    _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
+        #    inter_outputs.append(_out)
+        #    inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
 
         # 동기 all-gather 수행
-        with torch.cuda.stream(torch.cuda.Stream()):
-            for out, inp in zip(inter_outputs, inter_inputs):
-                dist.all_gather_into_tensor(
-                    out,
-                    inp,
-                    group=inter_node_comm_group
-                )
+        #with torch.cuda.stream(torch.cuda.Stream()):
+        #    for out, inp in zip(inter_outputs, inter_inputs):
+        #        dist.all_gather_into_tensor(
+        #            out,
+        #            inp,
+        #            group=inter_node_comm_group
+        #        )
         
         # 노드 내 all-gather 준비
         intra_outputs = []
@@ -387,8 +388,10 @@ class Penguin_Init(Init):
             ).narrow(1, local_rank, 1)
             
             # 데이터 복사
-            with torch.no_grad():
-                param_chunk.copy_(inter_outputs[i].view(param_chunk.size()))
+            #with torch.no_grad():
+            #    param_chunk.copy_(inter_outputs[i].view(param_chunk.size()))
+            # cpu에서 가져온 param_chunk를 param_tensors[i]에 복사
+            param_tensors[i].copy_(param_chunk, non_blocking=True)
                 
             output_chunks = torch.chunk(param_tensors[i], inter_node_size)
             for j, _out in enumerate(output_chunks):
