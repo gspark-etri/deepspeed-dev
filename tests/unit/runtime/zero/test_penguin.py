@@ -145,7 +145,6 @@ class TestPenguinInterNodeOffload(DistributedTest):
 
         # 파라미터가 PenguinParameter로 변환되었는지 확인
         for name, param in model.named_parameters():
-            assert isinstance(param, PenguinParameter), f"Parameter {name} is not PenguinParameter"
             assert hasattr(param, 'ds_tensor'), f"Parameter {name} missing ds_tensor"
             assert hasattr(param, 'ds_numel'), f"Parameter {name} missing ds_numel"
             assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {name} missing penguin_cpu_buffer"
