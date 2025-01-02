@@ -181,6 +181,11 @@ class Penguin_Init(Init):
                 param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
                 param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
                 param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+                logger.info(f"Parameter {param.ds_id} is now AVAILABLE on CPU.")
+        else:
+            logger.info(f"Parameter {param.ds_id} is already NOT_AVAILABLE on CPU.")
+
+        
         
         # 부모 클래스의 partition 호출
         super().partition(param, **kwargs)
@@ -330,43 +335,23 @@ class Penguin_Init(Init):
                                          requires_grad=False).view(-1)
             param_tensors.append(param_tensor)
 
-        # 노드 간 all-gather
-        #inter_outputs = []
-        #inter_inputs = []
-        #for i, p in enumerate(params):
-        #    inter_size = p.ds_tensor.ds_numel * inter_node_size
-        #    _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
-        #    inter_outputs.append(_out)
-        #    inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
-
-        # 동기 all-gather 수행
-        #with torch.cuda.stream(torch.cuda.Stream()):
-        #    for out, inp in zip(inter_outputs, inter_inputs):
-        #        dist.all_gather_into_tensor(
-        #            out,
-        #            inp,
-        #            group=inter_node_comm_group
-        #        )
-        
         # 노드 내 all-gather 준비
         intra_outputs = []
         intra_inputs = []
         for i, p in enumerate(params):
-            param_chunk = param_tensors[i].view(
-                (inter_node_size, intra_node_size, p.ds_tensor.ds_numel)
-            ).narrow(1, local_rank, 1)
+            # 텐서 reshape 수정
+            param_chunk_size = p.ds_tensor.ds_numel
+            param_chunk = p.ds_tensor.data.view(-1)
             
             # 데이터 복사
-            #with torch.no_grad():
-            #    param_chunk.copy_(inter_outputs[i].view(param_chunk.size()))
-            # cpu에서 가져온 param_chunk를 param_tensors[i]에 복사
-            param_tensors[i].copy_(param_chunk, non_blocking=True)
+            param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size).copy_(param_chunk)
                 
-            output_chunks = torch.chunk(param_tensors[i], inter_node_size)
-            for j, _out in enumerate(output_chunks):
-                intra_chunk_size = intra_node_size * p.ds_tensor.ds_numel
-                local_offset = local_rank * p.ds_tensor.ds_numel
-                _in = param_tensors[i].narrow(0, j * intra_chunk_size + local_offset, p.ds_tensor.ds_numel)
+            # 각 노드의 출력과 입력 준비
+            for j in range(intra_node_size):
+                chunk_start = j * param_chunk_size
+                chunk_end = (j + 1) * param_chunk_size
+                _out = param_tensors[i].narrow(0, chunk_start, param_chunk_size)
+                _in = param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size)
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
 
