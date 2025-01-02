@@ -2,7 +2,7 @@ import os
 import pytest
 import torch
 import deepspeed
-from deepspeed.runtime.zero.penguin import Penguin_Init, PenguinParameter
+from deepspeed.runtime.zero.penguin import Penguin_Init
 from unit.common import DistributedTest
 from deepspeed.accelerator import get_accelerator
 import torch.distributed as dist

@@ -49,7 +49,7 @@ from .pipe import PipelineModule
 
 from .git_version_info import version, git_hash, git_branch
 
-from .runtime.zero.penguin import Penguin_Init, PenguinParameter
+from .runtime.zero.penguin import Penguin_Init
 
 
 def _parse_version(version_str):

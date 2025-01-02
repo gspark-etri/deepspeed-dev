@@ -71,71 +71,6 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         self.complete = True
 
 
-class PenguinParameter(Parameter):
-    """DeepSpeed Penguin Parameter class for parameter partitioning"""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # 통신 그룹 초기화
-        if not hasattr(self, 'ds_process_group') or self.ds_process_group is None:
-            self.ds_process_group = dist.new_group(ranks=list(range(dist.get_world_size())))
-        if self.ds_process_group is None:
-            self.ds_process_group = dist.group.WORLD
-
-        # penguin_cpu_buffer 초기화
-        self._initialize_cpu_buffer()
-        self._init_partition()
-
-    def _initialize_cpu_buffer(self):
-        """Initialize or resize the CPU buffer for inter-mapped GPU parameters."""
-        if self._is_mapped_to_current_rank():
-            mapped_size = self.ds_numel if hasattr(self, 'ds_numel') else self.data.numel()
-            if not hasattr(self, 'penguin_cpu_buffer') or self.penguin_cpu_buffer.numel() != mapped_size:
-                self.penguin_cpu_buffer = torch.empty(
-                    mapped_size,
-                    dtype=self.dtype,
-                    device='cpu',
-                    pin_memory=True  # Use pinned memory for better performance
-                )
-                logger.info(f"Initialized CPU buffer for parameter {self.ds_id} with size {mapped_size}.")
-
-    def _is_mapped_to_current_rank(self) -> bool:
-        """Check if the parameter is mapped to the current rank."""
-        current_rank = dist.get_rank()
-        if hasattr(self, 'comm') and self.comm.param_shard_group is not None:
-            param_rank = dist.get_rank(group=self.comm.param_shard_group)
-            return current_rank == param_rank
-        return False
-
-    def _init_partition(self):
-        """Partition the parameter to CPU buffer"""
-        if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
-            return
-        with torch.no_grad():
-            super().partition()
-            # Check if the parameter is not mapped to the current rank
-            if self.comm.param_intra_node_rank == dist.get_rank(group=self.comm.param_inter_node_shard_group):
-                if self.comm.param_shard_rank != dist.get_rank():
-                    # Calculate the start and end indices for the current rank
-                    partition_size = self.ds_numel // self.comm.param_shard_size
-                    start = partition_size * self.comm.param_shard_rank
-                    end = start + partition_size
-
-                    # Store the param to the CPU buffer
-                    self.penguin_cpu_buffer[start:end].copy_(self.data.view(-1)[start:end], non_blocking=True)
-                    logger.info(f"Parameter {self.ds_id} is copied to CPU buffer from index {start} to {end}")
-
-                    # Optionally, clear the GPU data if needed
-                    self.data[start:end] = torch.zeros(end - start, dtype=self.dtype, device=self.device)
-                    logger.info(f"Parameter {self.ds_id} is set to zero on GPU from index {start} to {end}")
-
-                    self.ds_status = ZeroParamStatus.NOT_AVAILABLE
-
-    def ds_summary(self):
-        """Return a summary string of the parameter's DeepSpeed status"""
-        return f"Data type: {self.dtype}, Shape: {self.ds_shape}, Status: {self.ds_status}"
-
-
 class Penguin_Init(Init):
 
     def __init__(self,
@@ -155,7 +90,7 @@ class Penguin_Init(Init):
         assert config_dict_or_path is not None, "Must provide configuration for Penguin Initialization"
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path, mpu)
         
-        # config_dict에서 직접 설정 가져오기
+        # config_dict에서 설정 가져오기
         if isinstance(config_dict_or_path, dict):
             config_dict = config_dict_or_path
         else:
@@ -176,19 +111,12 @@ class Penguin_Init(Init):
         
         self.hierarchial_params_gather = penguin_config.get('hierarchial_params_gather', False)
 
-        # Init 클래스의 속성들 초기화
-        self.max_group_size = zero_config.get('max_group_size', 1000000000000)
-        self.param_persistence_threshold = zero_config.get('param_persistence_threshold', 100000)
-        self.model_persistence_threshold = zero_config.get('model_persistence_threshold', sys.maxsize)
-        self.dp_process_group = data_parallel_group
-
-        # 통신 그룹 초기화 - penguin_utils의 함수 사용
+        # 통신 그룹 초기화
         self.penguin_comm_groups = create_penguin_comm_groups(
             shard_size=self.shard_size,
             hierarchial_params_gather=self.hierarchial_params_gather
         )
 
-        # 부모 클래스 초기화
         super().__init__(module=module,
                         data_parallel_group=data_parallel_group,
                         sequence_data_parallel_group=sequence_data_parallel_group,
@@ -201,7 +129,52 @@ class Penguin_Init(Init):
                         dtype=dtype,
                         mpu=mpu)
 
-        self.is_forward = False
+    def _convert_to_deepspeed_param(self, param):
+        """Convert a regular parameter to a DeepSpeed parameter with Penguin features"""
+        # 먼저 부모 클래스의 변환 메서드 호출
+        super()._convert_to_deepspeed_param(param)
+        
+        # 통신 그룹 설정
+        param.comm = self.penguin_comm_groups
+        
+        # CPU 버퍼 초기화
+        mapped_size = param.ds_numel if hasattr(param, 'ds_numel') else param.data.numel()
+        param.penguin_cpu_buffer = torch.empty(
+            mapped_size,
+            dtype=param.dtype,
+            device='cpu',
+            pin_memory=True
+        )
+        logger.info(f"Initialized CPU buffer for parameter {param.ds_id} with size {mapped_size}.")
+
+        # 기존 all_gather_coalesced 메서드 저장
+        old_all_gather_coalesced = param.all_gather_coalesced
+
+        def _param_all_gather_coalesced(params, param_buffers=None, **kwargs):
+            """Penguin-specific all-gather operation"""
+            penguin_comm_groups = params[0].comm
+            hierarchical_all_gather = (penguin_comm_groups.param_intra_node_group is not None and 
+                                     penguin_comm_groups.param_inter_node_shard_group is not None)
+            
+            if dist.has_coalescing_manager() and hierarchical_all_gather:
+                return self._hierarchical_all_gather_params(params, param_buffers)
+            elif dist.has_coalescing_manager():
+                return self._flat_all_gather_with_coalescing_manager(params, param_buffers)
+            else:
+                return old_all_gather_coalesced(params, **kwargs)
+
+        # all_gather_coalesced 메서드 변경
+        param.all_gather_coalesced = _param_all_gather_coalesced
+
+        # 파라미터가 현재 랭크에 매핑되어 있지 않다면 CPU로 이동
+        if param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group):
+            with torch.no_grad():
+                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
+                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+                logger.info(f"param.comm.param_intra_node_rank: {param.comm.param_intra_node_rank}, dist.get_rank(group=param.comm.param_intra_node_group): {dist.get_rank(group=param.comm.param_intra_node_group)}")
+                logger.info(f"dist.get_rank(): {dist.get_rank()}")
+                logger.info(f"Parameter {param.ds_id} moved to CPU as it's not mapped to current rank.")
 
     def register_hooks(self, module):
         # Forward hook
@@ -220,39 +193,6 @@ class Penguin_Init(Init):
 
     def _start_backward(self, module, grad_input, grad_output):
         self.is_forward = False
-
-    def _convert_to_deepspeed_param(self, param):
-        # 먼저 부모 클래스의 변환을 수행하여 기본 속성들 초기화
-        super()._convert_to_deepspeed_param(param)
-        param.__class__ = PenguinParameter
-        
-        # penguin 전용 속성 추가
-        param.penguin_cpu_buffer = torch.empty(
-            param.ds_numel,
-            dtype=param.dtype,
-            device='cpu'
-        )
-        
-        # 통신 그룹 설정
-        param.comm = self.penguin_comm_groups
-        param.ds_process_group = self.dp_process_group
-
-        # 기존 all_gather_coalesced 메서드 저장
-        old_all_gather_coalesced = param.all_gather_coalesced
-
-        def _param_all_gather_coalesced(params, param_buffers=None, **kwargs):
-            """Penguin-specific all-gather operation"""
-            penguin_comm_groups: Penguin_CommGroups = params[0].comm
-            hierarchical_all_gather = has_hierarchical_all_gather_groups(penguin_comm_groups)
-            if dist.has_coalescing_manager() and hierarchical_all_gather:
-                return self._hierarchical_all_gather_params(params, param_buffers)
-            elif dist.has_coalescing_manager():
-                return self._flat_all_gather_with_coalescing_manager(params, param_buffers)
-            else:
-                return old_all_gather_coalesced(params, **kwargs)
-
-        # all_gather_coalesced 메서드 변경
-        param.all_gather_coalesced = _param_all_gather_coalesced
 
     def _pre_all_gather(self, params, params_buffers=None):
         # 모든 비동기 작업이 완료되었는지 확인
@@ -566,29 +506,3 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
                 logger.info(f"Parameter {param.ds_id} released from GPU memory.")
 
 
-def convert_to_penguin_param(param: Parameter, comm: Penguin_CommGroups) -> PenguinParameter:
-    """Convert a parameter to PenguinParameter"""
-    # Create PenguinParameter
-    param.__class__ = PenguinParameter
-    param.comm = comm
-    
-    # CPU buffer 초기화 - 파라미터의 실제 크기 사용
-    if hasattr(param, 'ds_tensor'):
-        buffer_size = param.ds_tensor.numel()
-    else:
-        buffer_size = param.numel()
-        
-    param.penguin_cpu_buffer = torch.zeros(buffer_size,
-                                         dtype=param.dtype,
-                                         device='cpu')
-    
-    # 초기화 시점에 CPU로 이동해야 하는지 확인
-    inter_rank = dist.get_rank(group=comm.param_inter_node_shard_group)
-    if comm.param_shard_rank != inter_rank:
-        # GPU에서 CPU로 비동기 복사
-        param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1).to(param.penguin_cpu_buffer.device), non_blocking=True)
-        logger.info(f"Parameter {param.ds_id} copied from GPU to CPU buffer.")
-        param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
-        param.ds_tensor.final_location = OffloadDeviceEnum.cpu
-    
-    return param
