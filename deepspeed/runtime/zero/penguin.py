@@ -131,21 +131,14 @@ class Penguin_Init(Init):
 
     def _convert_to_deepspeed_param(self, param):
         """Convert a regular parameter to a DeepSpeed parameter with Penguin features"""
-        # 먼저 부모 클래스의 변환 메서드 호출
+        # 부모 클래스의 변환 메서드 호출
         super()._convert_to_deepspeed_param(param)
-        
+
         # 통신 그룹 설정
         param.comm = self.penguin_comm_groups
         
-        # CPU 버퍼 초기화
-        mapped_size = param.ds_numel if hasattr(param, 'ds_numel') else param.data.numel()
-        param.penguin_cpu_buffer = torch.empty(
-            mapped_size,
-            dtype=param.dtype,
-            device='cpu',
-            pin_memory=True
-        )
-        logger.info(f"Initialized CPU buffer for parameter {param.ds_id} with size {mapped_size}.")
+        # CPU 버퍼는 나중에 초기화하도록 표시만 해둠
+        param.needs_cpu_buffer = True
 
         # 기존 all_gather_coalesced 메서드 저장
         old_all_gather_coalesced = param.all_gather_coalesced
@@ -166,15 +159,27 @@ class Penguin_Init(Init):
         # all_gather_coalesced 메서드 변경
         param.all_gather_coalesced = _param_all_gather_coalesced
 
-        # 파라미터가 현재 랭크에 매핑되어 있지 않다면 CPU로 이동
-        if param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group):
-            with torch.no_grad():
-                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
-                param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
-                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-                logger.info(f"param.comm.param_intra_node_rank: {param.comm.param_intra_node_rank}, dist.get_rank(group=param.comm.param_intra_node_group): {dist.get_rank(group=param.comm.param_intra_node_group)}")
-                logger.info(f"dist.get_rank(): {dist.get_rank()}")
-                logger.info(f"Parameter {param.ds_id} moved to CPU as it's not mapped to current rank.")
+    def partition(self, param, **kwargs):
+        """파라미터 파티셔닝 수행"""
+        # 부모 클래스의 partition 호출
+        super().partition(param, **kwargs)
+        
+        # ds_tensor가 설정된 후 CPU 버퍼 초기화
+        if hasattr(param, 'needs_cpu_buffer') and param.ds_tensor is not None:
+            param.penguin_cpu_buffer = torch.empty(
+                param.ds_tensor.ds_numel * (self.penguin_comm_groups.param_inter_node_size - 1),
+                dtype=param.dtype,
+                device='cpu',
+                pin_memory=True
+            )
+            delattr(param, 'needs_cpu_buffer')  # 초기화 완료 표시
+            
+            # 현재 rank가 파라미터를 가져야 하는 경우에만 CPU로 이동
+            if param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group):
+                with torch.no_grad():
+                    param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                    param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
+                    param.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
     def register_hooks(self, module):
         # Forward hook
