@@ -250,25 +250,36 @@ class Penguin_Init(Init):
         # 모든 비동기 작업이 완료되었는지 확인
         torch.cuda.synchronize()
 
+        # 이벤트 생성 및 기록
+        copy_event = torch.cuda.Event()
+
         for param in params:
             # 본인에게 해당하는 파라미터인지 확인 
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE and hasattr(param, 'penguin_cpu_buffer') and param.comm.param_shard_rank != dist.get_rank(group=param.comm.param_inter_node_shard_group):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
                     if hasattr(param, 'penguin_cpu_buffer'):
-                        # 비동기 복사 수행 및 핸들 생성
-                        copy_handle = param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
+                        # 비동기 복사 수행
+                        param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
                         param.ds_status = ZeroParamStatus.INFLIGHT
-                        # 복사가 완료되면 상태를 AVAILABLE로 변경
-                        def _copy_done_callback():
-                            param.ds_status = ZeroParamStatus.AVAILABLE
-                            logger.info(f"Parameter {param.ds_id} is now AVAILABLE on GPU after async copy.")
-                        # 현재 스트림에 콜백 등록
-                        torch.cuda.current_stream().add_callback(lambda: _copy_done_callback())
                         logger.info(f"Parameter {param.ds_id} copying from CPU buffer to GPU asynchronously.")
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
-                    
+
+        # 모든 복사 작업이 완료된 후 이벤트 기록
+        torch.cuda.current_stream().record_event(copy_event)
+
+        # 이벤트가 완료되면 상태를 AVAILABLE로 변경
+        def _copy_done_callback():
+            copy_event.synchronize()  # 이벤트가 완료될 때까지 대기
+            for param in params:
+                if param.ds_status == ZeroParamStatus.INFLIGHT:
+                    param.ds_status = ZeroParamStatus.AVAILABLE
+                    logger.info(f"Parameter {param.ds_id} is now AVAILABLE on GPU after async copy.")
+
+        # 비동기 작업 완료 후 콜백 실행
+        torch.cuda.current_stream().wait_event(copy_event)
+        _copy_done_callback()
 
         # ensure that each rank has params in same order. the allgather
         # is done by flattening the parameter list into a single tensor that
