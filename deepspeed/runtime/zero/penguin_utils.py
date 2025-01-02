@@ -104,34 +104,34 @@ def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
     global_rank = dist.get_rank()
     local_rank = get_accelerator().current_device()
     ndevices_per_node = get_accelerator().device_count()
+
+    groups = Penguin_CommGroups()
+    logger.info(f"global_rank: {global_rank}, local_rank: {local_rank}, ndevices_per_node: {ndevices_per_node}")
     
     if shard_size > world_size:
         raise ValueError(f"shard_size ({shard_size}) cannot be larger than world_size ({world_size})")
     if world_size % shard_size != 0:
         raise ValueError(f"world_size ({world_size}) must be divisible by shard_size ({shard_size})")
 
-    groups = Penguin_CommGroups()
-    logger.info(f"global_rank: {global_rank}, local_rank: {local_rank}, ndevices_per_node: {ndevices_per_node}")
-
     # Create shard groups
     for i in range(0, world_size, shard_size):
-        ranks = list(range(i, min(i + shard_size, world_size)))
-        group = dist.new_group(ranks)
-        if global_rank in ranks:
-            groups.param_shard_group = group
-            groups.param_shard_size = len(ranks)
-            groups.param_shard_rank = dist.get_rank(group)
+        _ranks = list(range(i, min(i + shard_size, world_size)))
+        _group = dist.new_group(_ranks)
+        if global_rank in _ranks:
+            groups.param_shard_group = _group
+            groups.param_shard_size = len(_ranks)
+            groups.param_shard_rank = dist.get_rank(_group)
 
     # Create replication groups
     num_replicas = world_size // shard_size
     if num_replicas > 1:
         for i in range(shard_size):
-            ranks = list(range(i, world_size, shard_size))
-            group = dist.new_group(ranks)
-            if global_rank in ranks:
-                groups.param_repli_group = group
-                groups.param_repli_size = len(ranks)
-                groups.param_repli_rank = dist.get_rank(group)
+            _ranks = list(range(i, world_size, shard_size))
+            _group = dist.new_group(_ranks)
+            if global_rank in _ranks:
+                groups.param_repli_group = _group
+                groups.param_repli_size = len(_ranks)
+                groups.param_repli_rank = dist.get_rank(_group)
     else:
         groups.param_repli_group = None
         groups.param_repli_size = 1
@@ -142,21 +142,42 @@ def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
         # Create intra-node groups
         local_world_size = ndevices_per_node
         for i in range(0, world_size, local_world_size):
-            ranks = list(range(i, min(i + local_world_size, world_size)))
-            group = dist.new_group(ranks)
-            if global_rank in ranks:
-                groups.param_intra_node_group = group
+            _ranks = list(range(i, min(i + local_world_size, world_size)))
+            _group = dist.new_group(_ranks)
+            if global_rank in _ranks:
+                groups.param_intra_node_group = _group
 
         # Create inter-node groups
         for i in range(local_world_size):
-            ranks = list(range(i, world_size, local_world_size))
-            group = dist.new_group(ranks)
-            if global_rank in ranks:
-                groups.param_inter_node_shard_group = group
+            _ranks = list(range(i, world_size, local_world_size))
+            _group = dist.new_group(_ranks)
+            if global_rank in _ranks:
+                groups.param_inter_node_shard_group = _group
 
-    logger.info(f"groups.param_shard_group: {groups.param_shard_group}, groups.param_shard_rank: {groups.param_shard_rank}")
-    logger.info(f"groups.param_repli_group: {groups.param_repli_group}, groups.param_repli_rank: {groups.param_repli_rank}")
-    logger.info(f"groups.param_intra_node_group: {groups.param_intra_node_group}, groups.param_inter_node_shard_group: {groups.param_inter_node_shard_group}")
+    # Log group info
+    if groups.param_shard_group is not None:
+        # Get ranks in shard group using dist.get_world_size() and dist.get_rank()
+        shard_size = dist.get_world_size(groups.param_shard_group)
+        shard_rank = dist.get_rank(groups.param_shard_group)
+        logger.info(f"Shard group size: {shard_size}, Current rank in shard group: {shard_rank}")
+
+    # Log replication group info 
+    if groups.param_repli_group is not None:
+        # Get ranks in replication group
+        repli_size = dist.get_world_size(groups.param_repli_group)
+        repli_rank = dist.get_rank(groups.param_repli_group)
+        logger.info(f"Replication group size: {repli_size}, Current rank in replication group: {repli_rank}")
+    # Log hierarchical group info and store ranks
+    if hierarchial_params_gather:
+        if groups.param_intra_node_group is not None:
+            intra_size = dist.get_world_size(groups.param_intra_node_group)
+            groups.param_intra_node_rank = dist.get_rank(groups.param_intra_node_group)
+            logger.info(f"Intra-node group size: {intra_size}, rank: {groups.param_intra_node_rank}")
+        if groups.param_inter_node_shard_group is not None:
+            inter_size = dist.get_world_size(groups.param_inter_node_shard_group)
+            groups.param_inter_node_rank = dist.get_rank(groups.param_inter_node_shard_group)
+            logger.info(f"Inter-node shard group size: {inter_size}, rank: {groups.param_inter_node_rank}")
+
     return groups
 
 

@@ -83,8 +83,8 @@ class PenguinParameter(Parameter):
             self.ds_process_group = dist.group.WORLD
 
         # penguin_cpu_buffer 초기화
-        self.partition()
-        #self._initialize_cpu_buffer()
+        self._initialize_cpu_buffer()
+        self._init_partition()
 
     def _initialize_cpu_buffer(self):
         """Initialize or resize the CPU buffer for inter-mapped GPU parameters."""
@@ -107,22 +107,30 @@ class PenguinParameter(Parameter):
             return current_rank == param_rank
         return False
 
-    def partition(self):
+    def _init_partition(self):
         """Partition the parameter to CPU buffer"""
         if self.ds_status != ZeroParamStatus.NOT_AVAILABLE:
             return
         with torch.no_grad():
-            if self._is_mapped_to_current_rank():
-                #add log        
-                logger.info(f"Parameter {self.ds_id} is mapped to current rank {dist.get_rank()}")
-                self._initialize_cpu_buffer()
-                logger.info(f"Parameter {self.ds_id} is initialized to CPU buffer")
-                self.penguin_cpu_buffer.copy_(self.data.view(-1), non_blocking=True)
-                logger.info(f"Parameter {self.ds_id} is copied to CPU buffer")
-            self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
-            logger.info(f"Parameter {self.ds_id} is set to zero on GPU")
-            self.ds_status = ZeroParamStatus.NOT_AVAILABLE
-            
+            super().partition()
+            # Check if the parameter is not mapped to the current rank
+            if self.comm.param_intra_node_rank == dist.get_rank(group=self.comm.param_inter_node_shard_group):
+                if self.comm.param_shard_rank != dist.get_rank():
+                    # Calculate the start and end indices for the current rank
+                    partition_size = self.ds_numel // self.comm.param_shard_size
+                    start = partition_size * self.comm.param_shard_rank
+                    end = start + partition_size
+
+                    # Store the param to the CPU buffer
+                    self.penguin_cpu_buffer[start:end].copy_(self.data.view(-1)[start:end], non_blocking=True)
+                    logger.info(f"Parameter {self.ds_id} is copied to CPU buffer from index {start} to {end}")
+
+                    # Optionally, clear the GPU data if needed
+                    self.data[start:end] = torch.zeros(end - start, dtype=self.dtype, device=self.device)
+                    logger.info(f"Parameter {self.ds_id} is set to zero on GPU from index {start} to {end}")
+
+                    self.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
     def ds_summary(self):
         """Return a summary string of the parameter's DeepSpeed status"""
         return f"Data type: {self.dtype}, Shape: {self.ds_shape}, Status: {self.ds_status}"
