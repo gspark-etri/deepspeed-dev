@@ -163,26 +163,27 @@ class Penguin_Init(Init):
         param.all_gather_coalesced = _param_all_gather_coalesced
 
     def partition(self, param, **kwargs):
-        """파라미터 파티셔닝 수행"""
-        # 부모 클래스의 partition 호출
-        super().partition(param, **kwargs)
-        
         # ds_tensor가 설정된 후 CPU 버퍼 초기화
         if hasattr(param, 'needs_cpu_buffer') and param.ds_tensor is not None:
-            param.penguin_cpu_buffer = torch.empty(
-                param.ds_tensor.ds_numel * (self.penguin_comm_groups.param_inter_node_size - 1),
-                dtype=param.dtype,
-                device='cpu',
-                pin_memory=True
-            )
+            # 현재 rank가 파라미터를 가져야 하는 경우에만 CPU 버퍼 생성
+            if self._should_copy_param_to_cpu(param):
+                param.penguin_cpu_buffer = torch.empty(
+                    param.ds_tensor.ds_numel,  # 실제 필요한 크기만큼만 할당
+                    dtype=param.dtype,
+                    device='cpu',
+                    pin_memory=True
+                )
             delattr(param, 'needs_cpu_buffer')  # 초기화 완료 표시
             
-            # 현재 rank가 파라미터를 가져야 하는 경우에만 CPU로 이동
-            if param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group):
-                with torch.no_grad():
-                    param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
-                    param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
-                    param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+        # 현재 rank가 파라미터를 가져야 하는 경우에만 CPU로 이동
+        if self._should_copy_param_to_cpu(param):
+            with torch.no_grad():
+                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
+                param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
+                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+        
+        # 부모 클래스의 partition 호출
+        super().partition(param, **kwargs)
 
     def register_hooks(self, module):
         # Forward hook
@@ -208,11 +209,15 @@ class Penguin_Init(Init):
                 and param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group)
                 and param.comm.param_shard_rank != dist.get_rank())
 
+    def _should_copy_param_to_cpu(self, param):
+        return (param.ds_status == ZeroParamStatus.AVAILABLE
+                and param.comm.param_intra_node_rank == dist.get_rank(group=param.comm.param_intra_node_group)
+                and param.comm.param_shard_rank != dist.get_rank())
+
     def _copy_param_from_cpu_to_gpu(self, param):
         assert param.penguin_cpu_buffer is not None
         param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
         param.ds_status = ZeroParamStatus.INFLIGHT
-
 
     def _pre_all_gather(self, params, params_buffers=None):
         # 모든 비동기 작업이 완료되었는지 확인
