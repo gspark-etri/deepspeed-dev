@@ -113,9 +113,14 @@ class PenguinParameter(Parameter):
             return
         with torch.no_grad():
             if self._is_mapped_to_current_rank():
+                #add log        
+                logger.info(f"Parameter {self.ds_id} is mapped to current rank {dist.get_rank()}")
                 self._initialize_cpu_buffer()
+                logger.info(f"Parameter {self.ds_id} is initialized to CPU buffer")
                 self.penguin_cpu_buffer.copy_(self.data.view(-1), non_blocking=True)
+                logger.info(f"Parameter {self.ds_id} is copied to CPU buffer")
             self.data = torch.zeros(1, dtype=self.dtype, device=self.device)
+            logger.info(f"Parameter {self.ds_id} is set to zero on GPU")
             self.ds_status = ZeroParamStatus.NOT_AVAILABLE
             
     def ds_summary(self):
@@ -251,12 +256,19 @@ class Penguin_Init(Init):
                 if not self.is_forward:
                     # CPU 버퍼에서 데이터를 가져옵니다.
                     if hasattr(param, 'penguin_cpu_buffer'):
-                        param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
-                        logger.info(f"Parameter {param.ds_id} copied from CPU buffer to GPU.")
+                        # 비동기 복사 수행 및 핸들 생성
+                        copy_handle = param.data.view(-1).copy_(param.penguin_cpu_buffer.narrow(0, 0, param.numel()), non_blocking=True)
+                        param.ds_status = ZeroParamStatus.INFLIGHT
+                        # 복사가 완료되면 상태를 AVAILABLE로 변경
+                        def _copy_done_callback():
+                            param.ds_status = ZeroParamStatus.AVAILABLE
+                            logger.info(f"Parameter {param.ds_id} is now AVAILABLE on GPU after async copy.")
+                        # 현재 스트림에 콜백 등록
+                        torch.cuda.current_stream().add_callback(lambda: _copy_done_callback())
+                        logger.info(f"Parameter {param.ds_id} copying from CPU buffer to GPU asynchronously.")
                     else:
                         raise RuntimeError(f"Parameter {param.ds_id} is not available and has no CPU buffer.")
                     
-                    param.ds_status = ZeroParamStatus.INFLIGHT
 
         # ensure that each rank has params in same order. the allgather
         # is done by flattening the parameter list into a single tensor that
@@ -354,7 +366,7 @@ class Penguin_Init(Init):
                     inp,
                     group=inter_node_comm_group
                 )
-
+        
         # 노드 내 all-gather 준비
         intra_outputs = []
         intra_inputs = []
