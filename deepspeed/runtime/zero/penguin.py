@@ -183,7 +183,7 @@ class Penguin_Init(Init):
                 param.ds_status = ZeroParamStatus.NOT_AVAILABLE
                 logger.info(f"Parameter {param.ds_id} is now AVAILABLE on CPU.")
         else:
-            logger.info(f"Parameter {param.ds_id} is already NOT_AVAILABLE on CPU.")
+            logger.info(f"Parameter {param.ds_id} is NOT_AVAILABLE on CPU.")
 
         
         
@@ -313,6 +313,7 @@ class Penguin_Init(Init):
         """Hierarchical all-gather implementation"""
         params, params_buffers = self._pre_all_gather(params, params_buffers)
 
+        # 통신 그룹 초기화
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
         local_rank = dist.get_rank(group=penguin_comm_groups.param_intra_node_group)
         inter_node_comm_group = penguin_comm_groups.param_inter_node_shard_group
@@ -322,6 +323,9 @@ class Penguin_Init(Init):
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
         
+        logger.info(f"Communication groups initialized - Local rank: {local_rank}, "
+                    f"Intra-node size: {intra_node_size}, Inter-node size: {inter_node_size}")
+
         # 파라미터 텐서 준비
         param_tensors = []
         for i, p in enumerate(params):
@@ -334,17 +338,20 @@ class Penguin_Init(Init):
                                          device=self.local_device,
                                          requires_grad=False).view(-1)
             param_tensors.append(param_tensor)
+        logger.info(f"Parameter tensors initialized with size {param_size}")
 
         # 노드 내 all-gather 준비
         intra_outputs = []
         intra_inputs = []
         for i, p in enumerate(params):
-            # 텐서 reshape 수정
             param_chunk_size = p.ds_tensor.ds_numel
             param_chunk = p.ds_tensor.data.view(-1)
             
+            logger.info(f"Processing parameter {i} - Chunk size: {param_chunk_size}")
+            
             # 데이터 복사
             param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size).copy_(param_chunk)
+            logger.info(f"Data copied for parameter {i} at local rank {local_rank}")
                 
             # 각 노드의 출력과 입력 준비
             for j in range(intra_node_size):
@@ -354,19 +361,26 @@ class Penguin_Init(Init):
                 _in = param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size)
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
+        
+        logger.info(f"Prepared {len(intra_outputs)} outputs and {len(intra_inputs)} inputs for all-gather")
 
         # 노드 내 all-gather (비동기)
+        logger.info("Starting asynchronous intra-node all-gather...")
         all_gather_handle = dist.all_gather_coalesced(
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
             async_op=True
         )
+        logger.info("Asynchronous all-gather operation initiated")
 
         # 결과 업데이트
         for i, param in enumerate(params):
             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
+            param.ds_status = ZeroParamStatus.INFLIGHT
+            logger.info(f"Parameter {i} updated and marked as INFLIGHT")
 
+        logger.info("Hierarchical all-gather completed, returning handle")
         return Penguin_AllGatherCoalescedHandle(
             allgather_handle=all_gather_handle,
             params=params,
@@ -411,6 +425,13 @@ class Penguin_Offload(DeepSpeedZeRoOffload):
                           remote_device=self.offload_device,
                           pin_memory=self.offload_param_pin_memory,
                           mpu=mpu)
+
+                #plz move param to cpu
+                for param in module.parameters():
+                    #check param is should be moved to cpu
+                    if self._should_copy_param_to_cpu(param):
+                        self._copy_param_from_gpu_to_cpu(param)
+                        logger.info(f"Parameter {param.ds_id} moved to CPU.")   
 
 
 class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
