@@ -111,6 +111,7 @@ def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
         raise ValueError(f"world_size ({world_size}) must be divisible by shard_size ({shard_size})")
 
     groups = Penguin_CommGroups()
+    logger.info(f"global_rank: {global_rank}, local_rank: {local_rank}, ndevices_per_node: {ndevices_per_node}")
 
     # Create shard groups
     for i in range(0, world_size, shard_size):
@@ -153,6 +154,7 @@ def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
             if global_rank in ranks:
                 groups.param_inter_node_shard_group = group
 
+    logger.info(f"groups: {groups}")
     return groups
 
 
