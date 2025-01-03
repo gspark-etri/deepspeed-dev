@@ -181,9 +181,9 @@ class Penguin_Init(Init):
                 param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
                 param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
                 param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-                logger.info(f"Parameter {param.ds_id} is now AVAILABLE on CPU.")
+                logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} is now AVAILABLE on CPU.")
         else:
-            logger.info(f"Parameter {param.ds_id} is NOT_AVAILABLE on CPU.")
+            logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} is NOT_AVAILABLE on CPU.")
 
         
         
@@ -232,13 +232,10 @@ class Penguin_Init(Init):
         copy_event = torch.cuda.Event()
 
         for param in params:
-            # 본인에게 해당하는 파라미터인지 확인 
-            logger.info(f"param.comm.param_shard_rank: {param.comm.param_shard_rank}, dist.get_rank(group=param.comm.param_inter_node_shard_group): {dist.get_rank(group=param.comm.param_inter_node_shard_group)}")
-
             if not self.is_forward:
                 if self._should_copy_param_to_gpu(param):
                     self._copy_param_from_cpu_to_gpu(param)
-                    logger.info(f"Parameter {param.ds_id} copying from CPU buffer to GPU asynchronously.")
+                    logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} copying from CPU buffer to GPU asynchronously.")
 
         
         # 모든 복사 작업이 완료된 후 이벤트 기록
@@ -250,7 +247,7 @@ class Penguin_Init(Init):
             for param in params:
                 if param.ds_status == ZeroParamStatus.INFLIGHT:
                     param.ds_status = ZeroParamStatus.AVAILABLE
-                    logger.info(f"Parameter {param.ds_id} is now AVAILABLE on GPU after async copy.")
+                    logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} is now AVAILABLE on GPU after async copy.")
 
         # 비동기 작업 완료 후 콜백 실행
         torch.cuda.current_stream().wait_event(copy_event)
@@ -277,9 +274,6 @@ class Penguin_Init(Init):
 
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
-        
-        logger.info(f"Communication groups initialized - Local rank: {local_rank}, "
-                    f"Intra-node size: {intra_node_size}, Inter-node size: {inter_node_size}")
 
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
@@ -315,11 +309,8 @@ class Penguin_Init(Init):
             param_chunk_size = p.ds_tensor.ds_numel
             param_chunk = p.ds_tensor.data.view(-1)
             
-            logger.info(f"Processing parameter {i} - Chunk size: {param_chunk_size}")
-            
             # 데이터 복사
             param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size).copy_(param_chunk)
-            logger.info(f"Data copied for parameter {i} at local rank {local_rank}")
                 
             # 각 노드의 출력과 입력 준비
             for j in range(intra_node_size):
@@ -329,23 +320,16 @@ class Penguin_Init(Init):
                 _in = param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size)
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
-        
-        logger.info(f"Prepared {len(intra_outputs)} outputs and {len(intra_inputs)} inputs for intra-node all-gather")
 
         # 노드 내 all-gather (비동기)
-        logger.info("Starting asynchronous intra-node all-gather...")
         intra_all_gather_handle = dist.all_gather_coalesced(
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
-            async_op=True
+            async_op=False
         )
 
-        if intra_all_gather_handle is not None:
-            intra_all_gather_handle.wait()
-            logger.info("Asynchronous intra-node all-gather operation completed")
-        else:
-            logger.error("Intra-node all-gather handle is None, skipping wait.")
+        logger.info("Intra-node all-gather completed")
 
         # 결과 업데이트
         for i, param in enumerate(params):
@@ -353,7 +337,6 @@ class Penguin_Init(Init):
             param.ds_status = ZeroParamStatus.AVAILABLE
             logger.info(f"Parameter {i} is now AVAILABLE on GPU.")
 
-        logger.info("Flat all-gather with coalescing manager completed, returning handle")
         return Penguin_AllGatherCoalescedHandle(
             allgather_handle=intra_all_gather_handle,
             params=params,
@@ -373,9 +356,6 @@ class Penguin_Init(Init):
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
         
-        logger.info(f"Communication groups initialized - Local rank: {local_rank}, "
-                    f"Intra-node size: {intra_node_size}, Inter-node size: {inter_node_size}")
-
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
             inter_outputs = [p.ds_tensor.data.view(-1) for p in params]
@@ -386,7 +366,7 @@ class Penguin_Init(Init):
                 inter_outputs,
                 inter_inputs,
                 group=inter_node_comm_group,
-                async_op=True
+                async_op=False
             )
             logger.info("Inter-node all-gather completed for forward pass.")
 
@@ -410,11 +390,8 @@ class Penguin_Init(Init):
             param_chunk_size = p.ds_tensor.ds_numel
             param_chunk = p.ds_tensor.data.view(-1)
             
-            logger.info(f"Processing parameter {i} - Chunk size: {param_chunk_size}")
-            
             # 데이터 복사
             param_tensors[i].narrow(0, local_rank * param_chunk_size, param_chunk_size).copy_(param_chunk)
-            logger.info(f"Data copied for parameter {i} at local rank {local_rank}")
                 
             # 각 노드의 출력과 입력 준비
             for j in range(intra_node_size):
@@ -425,24 +402,23 @@ class Penguin_Init(Init):
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
         
-        logger.info(f"Prepared {len(intra_outputs)} outputs and {len(intra_inputs)} inputs for intra-node all-gather")
 
         # 노드 내 all-gather (비동기)
-        logger.info("Starting asynchronous intra-node all-gather...")
         intra_all_gather_handle = dist.all_gather_coalesced(
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
-            async_op=True
+            async_op=False
         )
 
         # 결과 업데이트
         for i, param in enumerate(params):
             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
             param.ds_status = ZeroParamStatus.INFLIGHT
-            logger.info(f"Parameter {i} updated and marked as INFLIGHT")
+            logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} updated and marked as INFLIGHT")
+        
+        logger.info("Hierarchical all-gather completed")
 
-        logger.info("Hierarchical all-gather completed, returning handle")
         return Penguin_AllGatherCoalescedHandle(
             allgather_handle=intra_all_gather_handle,
             params=params,
@@ -493,7 +469,7 @@ class Penguin_Offload(DeepSpeedZeRoOffload):
                     #check param is should be moved to cpu
                     if self._should_copy_param_to_cpu(param):
                         self._copy_param_from_gpu_to_cpu(param)
-                        logger.info(f"Parameter {param.ds_id} moved to CPU.")   
+                        logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} moved to CPU.")   
 
 
 class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
@@ -592,6 +568,6 @@ class Penguin_Optimizer(DeepSpeedZeroOptimizer_Stage3):
                 # GPU 메모리를 해제합니다.
                 param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
                 param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-                logger.info(f"Parameter {param.ds_id} released from GPU memory.")
+                logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} released from GPU memory.")
 
 
