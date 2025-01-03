@@ -233,8 +233,17 @@ class Penguin_Init(Init):
     def _pre_all_gather(self, params, params_buffers=None):
         # 모든 비동기 작업이 완료되었는지 확인
         #torch.cuda.synchronize()
+        self._ensure_availability_of_partitioned_params(params)
 
-        # 이벤트 생성 및 기록
+        for param in params:
+            if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                raise RuntimeError(param.ds_summary())
+            param.ds_status = ZeroParamStatus.INFLIGHT
+
+        params = sorted(params, key=lambda p: p.ds_id)
+        return params, params_buffers
+
+    def _prepare_params_from_cpu(self, params, params_buffers=None):
         copy_event = torch.cuda.Event()
 
         for param in params:
@@ -243,7 +252,7 @@ class Penguin_Init(Init):
                     self._copy_param_from_cpu_to_gpu(param)
                     logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} copying from CPU buffer to GPU asynchronously.")
 
-        
+
         # 모든 복사 작업이 완료된 후 이벤트 기록
         torch.cuda.current_stream().record_event(copy_event)
 
@@ -297,7 +306,7 @@ class Penguin_Init(Init):
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
-            params, params_buffers = self._pre_all_gather(params, params_buffers)
+            params, params_buffers = self._prepare_params_from_cpu(params, params_buffers)
             logger.info("Parameters retrieved from cache for backward pass.")
 
         # 노드 내 all-gather 준비
@@ -353,8 +362,10 @@ class Penguin_Init(Init):
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
         """Hierarchical all-gather implementation"""
         # 로그 추가: 파라미터 상태 및 통신 그룹 확인
+        params, params_buffers = self._prepare_params_for_gpu(params, params_buffers)
         for param in params:
             logger.info(f"Before all-gather: Param {param.ds_id} status: {param.ds_status}")
+            assert param.ds_status == ZeroParamStatus.INFLIGHT, f"Param {param.ds_id} is not INFLIGHT"
 
         # 통신 그룹 초기화
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
@@ -385,7 +396,7 @@ class Penguin_Init(Init):
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
-            params, params_buffers = self._pre_all_gather(params, params_buffers)
+            params, params_buffers = self._prepare_params_from_cpu(params, params_buffers)
             logger.info("Parameters retrieved from cache for backward pass.")
 
         # 노드 내 all-gather 준비
