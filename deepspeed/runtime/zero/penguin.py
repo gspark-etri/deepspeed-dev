@@ -355,33 +355,14 @@ class Penguin_Init(Init):
 
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
-
-        inter_all_gather_handle = None
-        intra_all_gather_handle = None
-
-        inter_outputs = []
-        inter_inputs = []
-
-        param_tensors = []
-        for i, p in enumerate(params):
-            param_size = p.ds_tensor.ds_numel * param_shard_size
-            if params_buffers is not None and params_buffers[i] is not None:
-                assert params_buffers[i].numel(
-                ) == param_size, f'param_buffers[{i}] size {params_buffers[i].numel()} does not match with param_size {param_size}'
-                param_tensor = params_buffers[i]
-            else:
-                param_tensor = torch.empty(param_size, dtype=p.dtype, device=self.local_device,
-                                           requires_grad=False).view(-1)
-            param_tensors.append(param_tensor)
-
         
+        logger.info(f"Communication groups initialized - Local rank: {local_rank}, "
+                    f"Intra-node size: {intra_node_size}, Inter-node size: {inter_node_size}")
+
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
-            for i, p in enumerate(params):
-                inter_size = p.ds_tensor.ds_numel * inter_node_size
-                _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
-                inter_outputs.append(_out)
-                inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
+            inter_outputs = [p.ds_tensor.data.view(-1) for p in params]
+            inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
 
             # 동기 inter all-gather 수행
             dist.all_gather_coalesced(
@@ -424,7 +405,6 @@ class Penguin_Init(Init):
                 intra_outputs.append(_out)
                 intra_inputs.append(_in)
         
-
         # 노드 내 all-gather (비동기)
         intra_all_gather_handle = dist.all_gather_coalesced(
             intra_outputs,
@@ -432,6 +412,12 @@ class Penguin_Init(Init):
             group=intra_node_comm_group,
             async_op=True
         )
+
+        if intra_all_gather_handle is not None:
+            intra_all_gather_handle.wait()
+            logger.info("Asynchronous intra-node all-gather operation completed")
+        else:
+            logger.error("Intra-node all-gather handle is None, skipping wait.")
 
         # 결과 업데이트
         for i, param in enumerate(params):
