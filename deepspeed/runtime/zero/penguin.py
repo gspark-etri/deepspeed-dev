@@ -361,6 +361,8 @@ class Penguin_Init(Init):
 
         inter_outputs = []
         inter_inputs = []
+
+        param_tensors = []
         
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
