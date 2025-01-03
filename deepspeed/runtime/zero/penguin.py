@@ -363,6 +363,17 @@ class Penguin_Init(Init):
         inter_inputs = []
 
         param_tensors = []
+        for i, p in enumerate(params):
+            param_size = p.ds_tensor.ds_numel * param_shard_size
+            if params_buffers is not None and params_buffers[i] is not None:
+                assert params_buffers[i].numel(
+                ) == param_size, f'param_buffers[{i}] size {params_buffers[i].numel()} does not match with param_size {param_size}'
+                param_tensor = params_buffers[i]
+            else:
+                param_tensor = torch.empty(param_size, dtype=p.dtype, device=self.local_device,
+                                           requires_grad=False).view(-1)
+            param_tensors.append(param_tensor)
+
         
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
