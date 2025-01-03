@@ -376,35 +376,34 @@ class Penguin_Init(Init):
 
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
+        param_tensors = []
         
-        logger.info(f"Communication groups initialized - Local rank: {local_rank}, "
-                    f"Intra-node size: {intra_node_size}, Inter-node size: {inter_node_size}")
 
         if self.is_forward:
-            # Forward: inter all-gather 후 intra all-gather 수행
-            inter_outputs = [p.ds_tensor.data.view(-1) for p in params]
-            inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
+            for i, p in enumerate(params):
+                param_size = p.ds_tensor.ds_numel * param_shard_size
+                if params_buffers is not None and params_buffers[i] is not None:
+                    assert params_buffers[i].numel(
+                    ) == param_size, f'param_buffers[{i}] size {params_buffers[i].numel()} does not match with param_size {param_size}'
+                    param_tensor = params_buffers[i]
+                else:
+                    param_tensor = torch.empty(param_size, dtype=p.dtype, device=self.local_device,
+                                            requires_grad=False).view(-1)
+                param_tensors.append(param_tensor)
 
-            # 동기 inter all-gather 수행
-            inter_all_gather_handle = dist.all_gather_coalesced(
-                inter_outputs,
-                inter_inputs,
-                group=inter_node_comm_group,
-                async_op=True
-            )
-
-            Penguin_AllGatherCoalescedHandle(
-                allgather_handle=inter_all_gather_handle,
-                params=params,
-                partitions=[],
-                world_size=param_shard_size
-            )   
+            # inter node all-gather
+            inter_outputs = []
+            inter_inputs = []
+            for i, p in enumerate(params):
+                inter_size = p.ds_tensor.ds_numel * inter_node_size
+                _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
+                inter_outputs.append(_out)
+                inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
             
-            if inter_all_gather_handle is not None:
-                inter_all_gather_handle.wait()
-                logger.info("Inter-node all-gather completed for forward pass.")
-            else:
-                logger.error("Inter-node all-gather handle is None, skipping wait.")
+                try:
+                    dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
+                except RuntimeError as e:
+                    logger.error(f"RuntimeError during wait: {e}")
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
