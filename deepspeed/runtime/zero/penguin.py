@@ -362,7 +362,7 @@ class Penguin_Init(Init):
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
         """Hierarchical all-gather implementation"""
         # 로그 추가: 파라미터 상태 및 통신 그룹 확인
-        params, params_buffers = self._prepare_params_from_cpu(params, params_buffers)
+        params, params_buffers = self._pre_all_gather(params, params_buffers)
         for param in params:
             logger.info(f"Before all-gather: Param {param.ds_id} status: {param.ds_status}")
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"Param {param.ds_id} is not INFLIGHT"
