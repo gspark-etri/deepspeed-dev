@@ -381,17 +381,14 @@ class Penguin_Init(Init):
             inter_outputs = [p.ds_tensor.data.view(-1) for p in params]
             inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
 
-            inter_all_gather_handle = dist.all_gather_coalesced(
+            # 동기 inter all-gather 수행
+            dist.all_gather_coalesced(
                 inter_outputs,
                 inter_inputs,
                 group=inter_node_comm_group,
                 async_op=True
             )
-            if inter_all_gather_handle is not None:
-                inter_all_gather_handle.wait()
-                logger.info("Inter-node all-gather completed for forward pass.")
-            else:
-                logger.error("Inter-node all-gather handle is None, skipping wait.")
+            logger.info("Inter-node all-gather completed for forward pass.")
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
