@@ -386,12 +386,21 @@ class Penguin_Init(Init):
             inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
 
             # 동기 inter all-gather 수행
-            dist.all_gather_coalesced(
+            inter_all_gather_handle = dist.all_gather_coalesced(
                 inter_outputs,
                 inter_inputs,
                 group=inter_node_comm_group,
-                async_op=False
+                async_op=True
             )
+
+            Penguin_AllGatherCoalescedHandle(
+                allgather_handle=inter_all_gather_handle,
+                params=params,
+                partitions=[],
+                world_size=param_shard_size
+            )   
+            
+            inter_all_gather_handle.wait()  
             logger.info("Inter-node all-gather completed for forward pass.")
 
         else:
