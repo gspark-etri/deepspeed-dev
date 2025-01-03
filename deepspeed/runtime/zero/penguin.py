@@ -53,7 +53,8 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         """
         # let the current stream to op
         try:
-            # print("HANDLE", self.allgather_handle)
+            # 로그 추가: allgather_handle 상태 확인
+            logger.info(f"Waiting on allgather_handle: {self.allgather_handle}")
             instrument_w_nvtx(self.allgather_handle.wait)()
         except (ValueError, RuntimeError) as e:
             log_dist(
@@ -67,6 +68,7 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         for _, param in enumerate(self.params):
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
             param.ds_status = ZeroParamStatus.AVAILABLE
+            logger.info(f"Param {param.ds_id} status updated to AVAILABLE")
 
         self.complete = True
 
@@ -150,8 +152,12 @@ class Penguin_Init(Init):
             """Penguin-specific all-gather operation"""
             penguin_comm_groups = params[0].comm
             hierarchical_all_gather = (penguin_comm_groups.param_intra_node_group is not None and 
-                                     penguin_comm_groups.param_inter_node_shard_group is not None)
+                                       penguin_comm_groups.param_inter_node_shard_group is not None)
             
+            # 로그 추가: 파라미터 상태 및 통신 그룹 확인
+            for param in params:
+                logger.info(f"Param {param.ds_id} status: {param.ds_status}, comm group: {param.comm}")
+
             if dist.has_coalescing_manager() and hierarchical_all_gather:
                 return self._hierarchical_all_gather_params(params, param_buffers)
             elif dist.has_coalescing_manager():
@@ -226,7 +232,7 @@ class Penguin_Init(Init):
 
     def _pre_all_gather(self, params, params_buffers=None):
         # 모든 비동기 작업이 완료되었는지 확인
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
 
         # 이벤트 생성 및 기록
         copy_event = torch.cuda.Event()
@@ -346,6 +352,10 @@ class Penguin_Init(Init):
 
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
         """Hierarchical all-gather implementation"""
+        # 로그 추가: 파라미터 상태 및 통신 그룹 확인
+        for param in params:
+            logger.info(f"Before all-gather: Param {param.ds_id} status: {param.ds_status}")
+
         # 통신 그룹 초기화
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
         local_rank = dist.get_rank(group=penguin_comm_groups.param_intra_node_group)
