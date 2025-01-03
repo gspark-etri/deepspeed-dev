@@ -355,11 +355,20 @@ class Penguin_Init(Init):
 
         inter_node_size = dist.get_world_size(group=inter_node_comm_group)
         intra_node_size = dist.get_world_size(group=intra_node_comm_group)
+
+        inter_all_gather_handle = None
+        intra_all_gather_handle = None
+
+        inter_outputs = []
+        inter_inputs = []
         
         if self.is_forward:
             # Forward: inter all-gather 후 intra all-gather 수행
-            inter_outputs = [p.ds_tensor.data.view(-1) for p in params]
-            inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
+            for i, p in enumerate(params):
+                inter_size = p.ds_tensor.ds_numel * inter_node_size
+                _out = param_tensors[i].narrow(0, local_rank * inter_size, inter_size)
+                inter_outputs.append(_out)
+                inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
 
             # 동기 inter all-gather 수행
             dist.all_gather_coalesced(
