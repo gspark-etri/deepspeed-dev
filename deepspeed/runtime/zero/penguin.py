@@ -400,8 +400,11 @@ class Penguin_Init(Init):
                 world_size=param_shard_size
             )   
             
-            inter_all_gather_handle.wait()  
-            logger.info("Inter-node all-gather completed for forward pass.")
+            if inter_all_gather_handle is not None:
+                inter_all_gather_handle.wait()
+                logger.info("Inter-node all-gather completed for forward pass.")
+            else:
+                logger.error("Inter-node all-gather handle is None, skipping wait.")
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
