@@ -326,7 +326,7 @@ class Penguin_Init(Init):
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
-            async_op=False
+            async_op=True
         )
 
         logger.info("Intra-node all-gather completed")
@@ -408,7 +408,7 @@ class Penguin_Init(Init):
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
-            async_op=False
+            async_op=True
         )
 
         # 결과 업데이트
