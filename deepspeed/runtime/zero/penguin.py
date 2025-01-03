@@ -429,19 +429,13 @@ class Penguin_Init(Init):
 
         # 노드 내 all-gather (비동기)
         logger.info("Starting asynchronous intra-node all-gather...")
-        intra_all_gather_handle = dist.all_gather_coalesced(
+        dist.all_gather_coalesced(
             intra_outputs,
             intra_inputs,
             group=intra_node_comm_group,
             async_op=True
         )
-
-        if intra_all_gather_handle is not None:
-            intra_all_gather_handle.wait()
-            logger.info("Asynchronous intra-node all-gather operation completed")
-        else:
-            logger.error("Intra-node all-gather handle is None, skipping wait.")
-
+        
         # 결과 업데이트
         for i, param in enumerate(params):
             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
