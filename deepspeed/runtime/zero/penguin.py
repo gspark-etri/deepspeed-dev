@@ -335,8 +335,8 @@ class Penguin_Init(Init):
         # 결과 업데이트
         for i, param in enumerate(params):
             param.data = param_tensors[i].narrow(0, 0, param.ds_numel).view(param.ds_shape).data
-            param.ds_status = ZeroParamStatus.AVAILABLE
-            logger.info(f"Parameter {i} is now AVAILABLE on GPU.")
+            #param.ds_status = ZeroParamStatus.AVAILABLE
+            #logger.info(f"Parameter {i} is now AVAILABLE on GPU.")
 
         return Penguin_AllGatherCoalescedHandle(
             allgather_handle=intra_all_gather_handle,
@@ -386,7 +386,7 @@ class Penguin_Init(Init):
                 inter_outputs.append(_out)
                 inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
             
-            inter_all_gather_handle = dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
+            dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
             params, params_buffers = self._prepare_params_from_cpu(params, params_buffers)
