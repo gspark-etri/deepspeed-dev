@@ -53,8 +53,6 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         """
         # let the current stream to op
         try:
-            # 로그 추가: allgather_handle 상태 확인
-            logger.info(f"Waiting on allgather_handle: {self.allgather_handle}")
             instrument_w_nvtx(self.allgather_handle.wait)()
         except (ValueError, RuntimeError) as e:
             log_dist(
@@ -68,7 +66,6 @@ class Penguin_AllGatherCoalescedHandle(AllGatherCoalescedHandle):
         for _, param in enumerate(self.params):
             assert param.ds_status == ZeroParamStatus.INFLIGHT, f"expected param {param.ds_summary()} to be inflight"
             param.ds_status = ZeroParamStatus.AVAILABLE
-            logger.info(f"Param {param.ds_id} status updated to AVAILABLE")
 
         self.complete = True
 
@@ -180,18 +177,6 @@ class Penguin_Init(Init):
                     pin_memory=True
                 )
             delattr(param, 'needs_cpu_buffer')  # 초기화 완료 표시
-            
-        # 현재 rank가 파라미터를 가져야 하는 경우에만 CPU로 이동
-        if self._should_copy_param_to_cpu(param):
-            with torch.no_grad():
-                param.penguin_cpu_buffer.copy_(param.data.view(-1), non_blocking=True)
-                param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
-                param.ds_status = ZeroParamStatus.NOT_AVAILABLE
-                logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} is now AVAILABLE on CPU.")
-        else:
-            logger.info(f"Parameter {param.ds_id}-{param.comm.param_shard_rank} is NOT_AVAILABLE on CPU.")
-
-        
         
         # 부모 클래스의 partition 호출
         super().partition(param, **kwargs)
@@ -296,12 +281,13 @@ class Penguin_Init(Init):
             inter_inputs = [p.ds_tensor.data.view(-1) for p in params]
 
             # 동기 inter all-gather 수행
-            dist.all_gather_coalesced(
+            inter_all_gather_handle = dist.all_gather_coalesced(
                 inter_outputs,
                 inter_inputs,
                 group=inter_node_comm_group,
-                async_op=False
+                async_op=True
             )
+            inter_all_gather_handle.wait()
             logger.info("Inter-node all-gather completed for forward pass.")
 
         else:
@@ -400,10 +386,8 @@ class Penguin_Init(Init):
                 inter_outputs.append(_out)
                 inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
             
-                try:
-                    dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
-                except RuntimeError as e:
-                    logger.error(f"RuntimeError during wait: {e}")
+            inter_all_gather_handle = dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=True)
+            inter_all_gather_handle.wait()
 
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
@@ -444,12 +428,6 @@ class Penguin_Init(Init):
             group=intra_node_comm_group,
             async_op=True
         )
-
-        if intra_all_gather_handle is not None:
-            intra_all_gather_handle.wait()
-            logger.info("Asynchronous intra-node all-gather operation completed")
-        else:
-            logger.error("Intra-node all-gather handle is None, skipping wait.")
 
         # 결과 업데이트
         for i, param in enumerate(params):

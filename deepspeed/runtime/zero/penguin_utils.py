@@ -46,53 +46,7 @@ class Penguin_CommGroups:
     param_intra_node_group = None
     param_inter_node_shard_group = None
 
-    def _move_other_inter_params_to_cpu(self, params):
-        """다른 inter node의 파라미터들을 CPU로 이동시킵니다."""
-        for param in params:
-            if not hasattr(param, 'comm'):
-                continue
-            
-            inter_rank = dist.get_rank(group=self.param_inter_node_shard_group)
-            
-            # 현재 노드의 파라미터가 아닌 경우에만 CPU로 이동
-            if self.param_shard_rank != inter_rank:
-                # 필요한 속성들이 모두 있는지 확인
-                assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {param.ds_id} missing penguin_cpu_buffer"
-                
-                # GPU에서 CPU로 비동기 복사
-                param.penguin_cpu_buffer.copy_(param.ds_tensor.data.view(-1), non_blocking=True)
-                param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
-                param.ds_tensor.final_location = OffloadDeviceEnum.cpu
-
-    def _get_inter_params_from_cpu(self, params):
-        """CPU에 저장된 다른 inter node의 파라미터들을 다시 GPU로 가져옵니다."""
-        for param in params:
-            if not hasattr(param, 'comm'):
-                continue
-            
-            inter_rank = dist.get_rank(group=self.param_inter_node_shard_group)
-            
-            # 현재 노드의 파라미터가 아닌 경우에만 GPU로 복원
-            if self.param_shard_rank != inter_rank:
-                # 필요한 속성들이 모두 있는지 확인
-                assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {param.ds_id} missing penguin_cpu_buffer"
-                
-                if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
-                    # 안전을 위한 크기 체크
-                    if param.ds_tensor.numel() != param.penguin_cpu_buffer.numel():
-                        logger.warning(f"Tensor size mismatch for param {param.ds_id}. "
-                                       f"Resizing penguin_cpu_buffer from {param.penguin_cpu_buffer.numel()} "
-                                       f"to {param.ds_tensor.numel()}")
-                        param.penguin_cpu_buffer = torch.zeros(param.ds_tensor.numel(),
-                                                               dtype=param.dtype,
-                                                               device='cpu')
-                    
-                    param.ds_tensor.data.view(-1).copy_(param.penguin_cpu_buffer, non_blocking=True)
-                    param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
-                    param.ds_tensor.final_location = None
-
-
-def create_penguin_comm_groups(shard_size, hierarchial_params_gather=False):
+def create_penguin_comm_groups(shard_size, hierarchial_params_gather=True):
     """Create communication groups for Penguin partitioning strategy
     
     Args:
