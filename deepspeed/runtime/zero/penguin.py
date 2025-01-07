@@ -285,9 +285,9 @@ class Penguin_Init(Init):
                 inter_outputs,
                 inter_inputs,
                 group=inter_node_comm_group,
-                async_op=True
+                async_op=False
             )
-            inter_all_gather_handle.wait()
+            #inter_all_gather_handle.wait()
             logger.info("Inter-node all-gather completed for forward pass.")
 
         else:
@@ -386,9 +386,7 @@ class Penguin_Init(Init):
                 inter_outputs.append(_out)
                 inter_inputs.append(p.ds_tensor.data.view(-1).to(self.local_device))
             
-            inter_all_gather_handle = dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=True)
-            inter_all_gather_handle.wait()
-
+            inter_all_gather_handle = dist.all_gather_coalesced(inter_outputs, inter_inputs, group=inter_node_comm_group, async_op=False)
         else:
             # Backward: pre_all_gather를 통해 캐시에서 파라미터 가져오기
             params, params_buffers = self._prepare_params_from_cpu(params, params_buffers)
