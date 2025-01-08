@@ -817,6 +817,8 @@ class DeepSpeedConfig(object):
         self.zero_config = get_zero_config(param_dict)
         self.mics_shard_size = self.zero_config.mics_shard_size
         self.mics_hierarchial_params_gather = self.zero_config.mics_hierarchical_params_gather
+        self.penguin_shard_size = self.zero_config.penguin_shard_size
+        self.penguin_hierarchial_params_gather = self.zero_config.penguin_hierarchial_params_gather
         self.zero_optimization_stage = self.zero_config.stage
         self.zero_enabled = self.zero_optimization_stage > 0
 

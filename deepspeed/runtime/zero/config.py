@@ -339,6 +339,13 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     # Penguin config를 중첩 클래스로 변경
     penguin: Optional[PenguinConfig] = None
 
+    # Penguin 관련 설정
+    penguin_shard_size: int = Field(1, ge=0)
+    """Number of ranks in penguin parameters partitioning group"""
+    
+    penguin_hierarchial_params_gather: bool = False
+    """Boolean indicating whether to use hierarchical parameter gathering for Penguin"""
+
     # Validators
     @model_validator(mode="after")
     def overlap_comm_valid(self):

@@ -21,7 +21,6 @@ import deepspeed.runtime.compiler as compiler
 from deepspeed.runtime.compiler import is_compiling
 
 import logging
-import torch
 
 ENABLE_PROFILER = False
 
@@ -455,11 +454,6 @@ class PartitionedParameterCoordinator:
         the work handle for the in flight parameters."""
         partitioned_params = []
         all_gather_numel = 0  # numel = num of elements
-        
-        # Backward pass에서 CPU buffer로부터 데이터 복원
-        if not forward and hasattr(params[0], 'comm'):
-            params[0].comm._get_inter_params_from_cpu(params)
-
         for param in params:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 partitioned_params.append(param)
@@ -482,8 +476,7 @@ class PartitionedParameterCoordinator:
                 with get_accelerator().stream(self.__allgather_stream):
                     event_name = __class__.FORWARD_ALL_GATHER if forward else __class__.BACKWARD_ALL_GATHER
                     self.__profiler.start_event(event_name)
-                    handle = param_group[0].all_gather_coalesced(param_group, forward=forward, quantize=quantize)
-
+                    handle = param_group[0].all_gather_coalesced(param_group, quantize=quantize)
                     self.__profiler.stop_event(event_name, all_gather_numel)
                 for param in param_group:
                     assert param.ds_status == ZeroParamStatus.INFLIGHT, param.ds_summary()
@@ -570,16 +563,3 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
-
-    def _is_mapped_to_current_rank(self, param: Parameter) -> bool:
-        # 현재 랭크를 가져옵니다.
-        current_rank = dist.get_rank()
-
-        # 파라미터의 통신 그룹을 사용하여 소유 랭크를 결정합니다.
-        if hasattr(param, 'comm') and param.comm.param_shard_group is not None:
-            param_rank = dist.get_rank(group=param.comm.param_shard_group)
-        else:
-            raise RuntimeError("Parameter does not have a valid communication group.")
-
-        # 현재 랭크와 파라미터의 소유 랭크가 일치하는지 확인합니다.
-        return current_rank == param_rank

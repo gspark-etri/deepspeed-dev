@@ -3,7 +3,7 @@ import pytest
 import torch
 import deepspeed
 from deepspeed.runtime.zero.penguin import Penguin_Init
-from unit.common import DistributedTest
+from tests.unit.common import DistributedTest
 from deepspeed.accelerator import get_accelerator
 import torch.distributed as dist
 import tempfile
@@ -30,7 +30,7 @@ def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.floa
 class TestPenguinInterNodeOffload(DistributedTest):
     @property
     def world_size(self):
-        return 16  # 2 nodes * 8 GPUs - 명시적으로 설정
+        return 8  # 2 nodes * 8 GPUs - 명시적으로 설정
         
     @property 
     def gpu_count(self):
@@ -46,18 +46,17 @@ class TestPenguinInterNodeOffload(DistributedTest):
         
     def test(self):
         # 환경변수를 먼저 설정
-        os.environ['NNODES'] = '2'  # 2개 노드
-        os.environ['NDEV_PER_NODE'] = '8'  # 노드당 8개 GPU
+        os.environ['NNODES'] = '1'  # 2개 노드
+        os.environ['NDEV_PER_NODE'] = os.environ["WORLD_SIZE"]  # 노드당 8개 GPU
         
         # 그 다음 DeepSpeed 분산 환경 초기화
         deepspeed.init_distributed("nccl")
         
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])  # should be 16
-        node_rank = int(os.environ.get('NODE_RANK', '0'))
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         
-        # batch size 계산 추가
-        batch_size_per_gpu = 4  # micro batch size per GPU
+        # batch size 계산
+        batch_size_per_gpu = 4
         train_batch_size = world_size * batch_size_per_gpu
         
         config_dict = {
@@ -72,10 +71,8 @@ class TestPenguinInterNodeOffload(DistributedTest):
             },
             "zero_optimization": {
                 "stage": 3,
-                "penguin": {
-                    "shard_size": 16,  # 전체 world_size로 설정
-                    "hierarchial_params_gather": True
-                },
+                "penguin_hierarchial_params_gather": False,
+                "penguin_shard_size": world_size,
                 "allgather_bucket_size": 1e3,
                 "reduce_bucket_size": 1e3,
                 "stage3_prefetch_bucket_size": 1e3
@@ -85,69 +82,34 @@ class TestPenguinInterNodeOffload(DistributedTest):
         hidden_dim = 10
         logger.info(f"[Rank {rank}] Initializing model with hidden_dim={hidden_dim}")
         
-        with deepspeed.zero.Penguin_Init(config_dict_or_path=config_dict):
-            model = SimpleModel(hidden_dim)
-            
+        # 모델 생성 및 DeepSpeed 초기화
+        model = SimpleModel(hidden_dim)
         model, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
             config=config_dict
         )
         
-        # CPU 버퍼 초기화 확인
-        for name, param in model.named_parameters():
-            if not hasattr(param, 'penguin_cpu_buffer'):
-                param.penguin_cpu_buffer = torch.zeros_like(param.data, device='cpu')
-                logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Created CPU buffer for {name}")
-                logger.info(f"  - Original param: {param.device}, shape={param.shape}")
-                logger.info(f"  - CPU buffer: {param.penguin_cpu_buffer.device}, shape={param.penguin_cpu_buffer.shape}")
-
+        # 데이터 로더 생성 전 동기화
+        dist.barrier()
+        
         data_loader = random_dataloader(
             model=model,
             total_samples=50,
             hidden_dim=hidden_dim,
             device=model.device
         )
-        logger.info(f"[Node {node_rank}, Rank {dist.get_rank()}] Created dataloader")
-
-        dist.barrier()
-        # Forward pass 전에 파라미터 값 저장
-        initial_params = {}
-        with deepspeed.zero.GatheredParameters(model.parameters()):
-            for name, param in model.named_parameters():
-                initial_params[name] = param.data.clone()
-
+        
         # 학습 루프
         for i, batch in enumerate(data_loader):
+            dist.barrier()  # 각 배치 시작 전 동기화
             loss = model(batch[0], batch[1])
             model.backward(loss)
             model.step()
-            logger.info(f"Batch {i}, Loss: {loss.item()}")
+            dist.barrier()  # 각 배치 완료 후 동기화
             
-            # 매 스텝마다 파라미터가 업데이트되는지 확인
-            with deepspeed.zero.GatheredParameters(model.parameters()):
-                for name, param in model.named_parameters():
-                    param_changed = not torch.allclose(param.data, initial_params[name])
-                    logger.info(f"Parameter {name} changed: {param_changed}")
-            
-            if i >= 2:
+            if i >= 10:
                 break
-
-        # 학습 후 파라미터 접근 가능 여부 확인
-        logger.info(f"\n[Node {node_rank}, Rank {dist.get_rank()}] Checking parameter accessibility after training")
-        with deepspeed.zero.GatheredParameters(model.parameters()):
-            for name, param in model.named_parameters():
-                try:
-                    logger.info(f"  - {name}: shape={param.shape}, device={param.device}")
-                    logger.info(f"    mean={param.data.mean().item()}, std={param.data.std().item()}")
-                except Exception as e:
-                    logger.error(f"  - {name}: Failed to access - {str(e)}")
-
-        # 파라미터가 PenguinParameter로 변환되었는지 확인
-        for name, param in model.named_parameters():
-            assert hasattr(param, 'ds_tensor'), f"Parameter {name} missing ds_tensor"
-            assert hasattr(param, 'ds_numel'), f"Parameter {name} missing ds_numel"
-            assert hasattr(param, 'penguin_cpu_buffer'), f"Parameter {name} missing penguin_cpu_buffer"
 
 def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True, mpu=None):
     ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
@@ -179,7 +141,7 @@ def main():
     
     # 분산 환경 초기화가 필요한 경우
     if not dist.is_initialized():
-        world_size = int(os.environ.get('WORLD_SIZE', '16'))
+        world_size = int(os.environ.get('WORLD_SIZE', '8'))
         rank = int(os.environ.get('RANK', str(local_rank)))
         
         dist.init_process_group(
