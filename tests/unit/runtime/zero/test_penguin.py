@@ -10,7 +10,8 @@ import tempfile
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 from deepspeed.runtime.zero.partition_parameters import (
     ZeroParamStatus,
-    PartitionedParamStatus
+    PartitionedParamStatus,
+    GatheredParameters
 )
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 import logging
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 def random_dataloader(model, total_samples, hidden_dim, device, dtype=torch.float):
     batch_size = 4
+    # [total_samples, hidden_dim] 형태로 데이터 생성
     train_data = torch.randn(total_samples, hidden_dim, dtype=dtype, device=device)
     train_label = torch.empty(total_samples, dtype=torch.long, device=device).random_(hidden_dim)
     train_dataset = torch.utils.data.TensorDataset(train_data, train_label)
@@ -44,24 +46,28 @@ class TestPenguinInterNodeOffload(DistributedTest):
         # 분산 환경이 이미 설정되어 있으므로 skip
         pass
         
+    def check_param_location(self, model, step_name):
+        """파라미터의 현재 위치를 체크하고 출력"""
+        rank = dist.get_rank()
+        for name, param in model.named_parameters():
+            if hasattr(param, 'ds_status'):
+                location = "CPU" if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE else "GPU"
+                print(f"[Rank {rank}] {step_name} - Param {name} is on {location}")
+
     def test(self):
-        # 환경변수를 먼저 설정
-        os.environ['NNODES'] = '1'  # 2개 노드
-        os.environ['NDEV_PER_NODE'] = os.environ["WORLD_SIZE"]  # 노드당 8개 GPU
+        # 로그 레벨 설정
+        deepspeed.utils.logger.setLevel(logging.INFO)
         
-        # 그 다음 DeepSpeed 분산 환경 초기화
-        deepspeed.init_distributed("nccl")
+        # 환경변수 설정
+        os.environ['NNODES'] = '1'
+        os.environ['NDEV_PER_NODE'] = os.environ["WORLD_SIZE"]
         
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         
-        # batch size 계산
-        batch_size_per_gpu = 4
-        train_batch_size = world_size * batch_size_per_gpu
-        
         config_dict = {
-            "train_batch_size": train_batch_size,
-            "train_micro_batch_size_per_gpu": batch_size_per_gpu,
+            "train_batch_size": world_size * 4,
+            "train_micro_batch_size_per_gpu": 4,
             "steps_per_print": 1,
             "optimizer": {
                 "type": "Adam",
@@ -75,41 +81,58 @@ class TestPenguinInterNodeOffload(DistributedTest):
                 "penguin_shard_size": world_size,
                 "allgather_bucket_size": 1e3,
                 "reduce_bucket_size": 1e3,
-                "stage3_prefetch_bucket_size": 1e3
+                "stage3_prefetch_bucket_size": 1e3,
+                "offload_param": {
+                    "device": "cpu",
+                    "pin_memory": True,
+                    "buffer_count": 1,
+                    "buffer_size": 1e4
+                }
             }
         }
         
         hidden_dim = 10
         logger.info(f"[Rank {rank}] Initializing model with hidden_dim={hidden_dim}")
         
-        # 모델 생성 및 DeepSpeed 초기화
-        model = SimpleModel(hidden_dim)
-        model, _, _, _ = deepspeed.initialize(
-            model=model,
-            model_parameters=model.parameters(),
-            config=config_dict
-        )
-        
-        # 데이터 로더 생성 전 동기화
-        dist.barrier()
-        
-        data_loader = random_dataloader(
-            model=model,
-            total_samples=50,
-            hidden_dim=hidden_dim,
-            device=model.device
-        )
-        
-        # 학습 루프
-        for i, batch in enumerate(data_loader):
-            dist.barrier()  # 각 배치 시작 전 동기화
-            loss = model(batch[0], batch[1])
-            model.backward(loss)
-            model.step()
-            dist.barrier()  # 각 배치 완료 후 동기화
+        # Penguin_Init 사용
+        with deepspeed.zero.Penguin_Init(config_dict_or_path=config_dict):
+            # 최소한의 모델 사용
+            model = SimplestModel(hidden_dim)
             
-            if i >= 10:
-                break
+            # 옵티마이저 생성
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+            
+            data_loader = random_dataloader(
+                model=model,
+                total_samples=50,
+                hidden_dim=hidden_dim,
+                device=torch.device(f'cuda:{rank}')
+            )
+            
+            # 학습 루프
+            for i, batch in enumerate(data_loader):
+                # 파라미터 위치 체크
+                self.check_param_location(model, "Before Forward")
+                
+                # 단순 스칼라 출력
+                loss = model(batch[0])
+                
+                # 파라미터 위치 체크
+                self.check_param_location(model, "Before Backward")
+                
+                # backward 계산
+                loss.backward()
+                
+                # 파라미터 위치 체크
+                self.check_param_location(model, "Before Step")
+                
+                # GatheredParameters 컨텍스트 내에서 업데이트 수행
+                with GatheredParameters(model.param, modifier_rank=0):
+                    optimizer.step()
+                optimizer.zero_grad()
+                
+                if i >= 2:  # 처음 몇 iteration만
+                    break
 
 def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True, mpu=None):
     ndevices_per_node = int(os.environ.get("NDEV_PER_NODE", get_accelerator().device_count()))
@@ -119,18 +142,18 @@ def create_penguin_comm_groups(shard_size, dp_group, hierarchical_allgather=True
     world_size = ndevices_per_node * n_nodes
     assert dist.get_world_size() == world_size, "Mismatch in world size"
 
-class SimpleModel(torch.nn.Module):
+class SimplestModel(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.cross_entropy = torch.nn.CrossEntropyLoss()
-
-    def forward(self, x, y):
-        hidden = self.linear1(x)
-        output = self.linear2(hidden)
-        loss = self.cross_entropy(output, y)
-        return loss
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # world size에 맞게 파라미터 생성 (각 랭크에서 빈 텐서가 발생하지 않도록)
+        self.param = torch.nn.Parameter(torch.ones(world_size))
+        
+    def forward(self, x):
+        # GatheredParameters 컨텍스트 내에서 전체 파라미터 사용
+        with GatheredParameters(self.param, modifier_rank=0):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            return self.param[rank] * x.mean()
 
 def main():
     # DeepSpeed launcher가 제공하는 local_rank 사용

@@ -305,7 +305,7 @@ class PartitionedParameterCoordinator:
                     debug_rank0(f"-fetch: {param.ds_summary()}")
             self.__all_gather_params(params_to_fetch, forward)
             self.__profiler.stop_event(event_name, fetch_numel)
-
+        
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)

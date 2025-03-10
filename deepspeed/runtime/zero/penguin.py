@@ -10,12 +10,14 @@ from deepspeed.runtime.zero.penguin_utils import (Penguin_CommGroups, create_pen
 from deepspeed.runtime.zero.mics import MiCS_AllGatherCoalescedHandle, MiCS_Optimizer, MiCS_Offload, MiCS_Init
 from deepspeed.runtime.zero.partition_parameters import Init, AllGatherCoalescedHandle, ZeroParamStatus
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, DeepSpeedZeroOffloadParamConfig
+from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 from deepspeed.utils import instrument_w_nvtx, log_dist, logger
 from deepspeed.accelerator import get_accelerator
 from torch import Tensor
 from torch.nn import Parameter
 from deepspeed.runtime.zero.mics import MiCS_Init
-from deepspeed.runtime.zero.partition_parameters import Init
+from deepspeed.runtime.zero.partition_parameters import *
+from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator
 
 def has_hierarchical_all_gather_groups(comm_groups: Penguin_CommGroups):
     result = False
@@ -44,6 +46,8 @@ class Penguin_Init(Init):
                  enabled=True,
                  dtype=None,
                  mpu=None):
+    
+        print("gspark: Penguin_Init calling")
 
         assert config_dict_or_path is not None, "Must provide configuration for MiCS Initialization"
         _ds_config = deepspeed.runtime.config.DeepSpeedConfig(config_dict_or_path, mpu)
@@ -76,13 +80,6 @@ class Penguin_Init(Init):
 
         super().__init__(module, data_parallel_group, mem_efficient_linear, remote_device, pin_memory,
                          config_dict_or_path, config, enabled, dtype, mpu)
-    
-    def partition(self, param, **kwargs):
-        if self.is_forward:
-            #TODO: copy param to cpu if needed
-            pass 
-
-        super().partition(param, **kwargs)
     
     def register_hooks(self, module):
         # Forward hook
@@ -128,6 +125,7 @@ class Penguin_Init(Init):
         param_shard_size = penguin_comm_groups.param_shard_size
 
         #todo: forward aware allgather and tranfer to cpu if needed
+        print("gspark: _flat_all_gather_with_coalescing_manager calling")
 
         output_tensors = []
         input_tensors = []
@@ -160,6 +158,8 @@ class Penguin_Init(Init):
 
     def _hierarchical_all_gather_params(self, params, params_buffers=None):
         params, params_buffers = self._pre_all_gather(params, params_buffers)
+
+        print("gspark: hierarchical_all_gather_params calling")
 
         penguin_comm_groups: Penguin_CommGroups = params[0].comm
         local_rank = dist.get_rank(group=penguin_comm_groups.param_intra_node_group)
@@ -245,7 +245,7 @@ class Penguin_Init(Init):
             
         return params, params_buffers
 
-class Penguin_Offload(MiCS_Offload):
+class Penguin_Offload(DeepSpeedZeRoOffload):
     def _convert_to_zero_parameters(self, ds_config, module, mpu):
         log_dist(f'Convert to zero parameters from MiCS Offload manager', ranks=[0])
         non_zero_params = [p for p in module.parameters() if not is_zero_param(p)]
@@ -266,6 +266,15 @@ class Penguin_Offload(MiCS_Offload):
                           pin_memory=self.offload_param_pin_memory,
                           mpu=mpu)
 
+class PenguinPartitionedParameterCoordinator(PartitionedParameterCoordinator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
+        pass
+
+    def release_sub_module(self, current_submodule: Module) -> None:
+        pass
 
 class Penguin_Optimizer(MiCS_Optimizer):
     def __init__(self, module, init_optimizer, timers, ds_config, static_loss_scale=1, dynamic_loss_scale=False, dynamic_loss_args=None, verbose=True, contiguous_gradients=True, reduce_bucket_size=500000000, prefetch_bucket_size=5000000, max_reuse_distance=1000000000, max_live_parameters=1000000000, param_persistence_threshold=100000, model_persistence_threshold=sys.maxsize, dp_process_group=None, reduce_scatter=True, overlap_comm=False, offload_optimizer_config=None, offload_param_config=None, sub_group_size=1000000000000, offload_ratio=0.0, mpu=None, clip_grad=0, gradient_accumulation_dtype=torch.float16, communication_data_type=torch.float16, postscale_gradients=True, gradient_predivide_factor=1, gradient_accumulation_steps=1, elastic_checkpoint=False, aio_config=None):
@@ -278,6 +287,9 @@ class Penguin_Optimizer(MiCS_Optimizer):
         )
 
         super().__init__(module, init_optimizer, timers, ds_config, static_loss_scale, dynamic_loss_scale, dynamic_loss_args, verbose, contiguous_gradients, reduce_bucket_size, prefetch_bucket_size, max_reuse_distance, max_live_parameters, param_persistence_threshold, model_persistence_threshold, dp_process_group, reduce_scatter, overlap_comm, offload_optimizer_config, offload_param_config, sub_group_size, offload_ratio, mpu, clip_grad, gradient_accumulation_dtype, communication_data_type, postscale_gradients, gradient_predivide_factor, gradient_accumulation_steps, elastic_checkpoint, aio_config)
+    
+    def initialize_ds_offload(self, *args, **kwargs):
+        return Penguin_Offload(*args, **kwargs)
 
     def _create_fp16_partitions_with_defragmentation(self, fp16_param_groups):
         #TODO: penguin 적용, 필요한 parameter만 partitions
@@ -314,3 +326,14 @@ class Penguin_Optimizer(MiCS_Optimizer):
             for grad_buff in partitioned_grads_buffers:
                 grad_buff.view(-1).copy_(aggregated_buffer.narrow(0, offset, grad_buff.numel()))
                 offset += grad_buff.numel()
+
+class SimpleModel(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # 선형 레이어 하나로 축소
+        self.linear = torch.nn.Linear(hidden_dim, 1)
+        
+    def forward(self, x, y):
+        # 단순 스칼라 출력 반환
+        out = self.linear(x).sum()
+        return out
